@@ -749,6 +749,10 @@ export interface RawYamlConfig {
     enabled?: boolean;
     extractors?: string[];
   };
+  memCommand?: {
+    enabled?: boolean;
+    allowedCommands?: string[];
+  };
   sessionInit?: {
     enabled?: boolean;
     maxRetries?: number;

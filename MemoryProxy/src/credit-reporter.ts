@@ -74,7 +74,7 @@ export function extractSpaceIdFromPath(path: string): string | null {
   if (match) {
     const agent = safePath.split("/").filter(Boolean)[0] ?? "";
     // Only capture spaceId when the first segment looks like an agent name
-    if (/^(claude-code|codebuddy|cursor|hermes|openclaw)$/i.test(agent)) {
+    if (/^(claude-code|codebuddy|cursor|hermes|openclaw|codex|openai)$/i.test(agent)) {
       return match[1] || null;
     }
   }
@@ -146,10 +146,11 @@ export function computeCreditDelta(
     cacheWrite1h = Math.max(0, totalCacheWrite - ephemeral5m);
   } else {
     // OpenAI: prompt_tokens 含缓存，需减去 cached_tokens
-    const promptDetails = usage.prompt_tokens_details as Record<string, unknown> | undefined;
-    const promptTokens = numField(usage.prompt_tokens);
+    const promptDetails = (usage.prompt_tokens_details ?? usage.input_tokens_details) as Record<string, unknown> | undefined;
+    const promptTokens = numField(usage.prompt_tokens) || numField(usage.input_tokens);
     cacheRead =
       numField(usage.cache_read_tokens) ||
+      numField(usage.cache_read_input_tokens) ||
       numField(promptDetails?.cached_tokens);
     nonCacheInput = Math.max(0, promptTokens - cacheRead);
     // OpenAI 协议在 TokenHub 现有模型上无 cache write 概念，强制 0，

@@ -4,10 +4,24 @@
 #
 # 所有字段均有默认值，未配置的字段自动回落。下面列出每个配置项的含义和用法。
 #
-# 请求处理流程：
+# Chat/Messages 请求处理流程：
 #   客户端请求 → auth(鉴权) → sessionInit(会话初始化: 弹窗选 team/agent/task)
 #   → injection(上下文注入: skill/memory/wiki/knowledge 到 system prompt)
-#   → 转发上游 LLM → 用量/上报 → 返回客户端
+#   → 转发上游 LLM → 对话回流/用量上报 → 返回客户端
+# Responses 请求走独立的透明 transport：鉴权 → 原始 JSON 转发 → JSON/SSE
+#   原样返回，并旁路解析 usage；启用 sessionInit/injection 时复用对应的
+#   session、instructions 注入、限流、最终 L0/Skill 回流。
+#
+# 主协议/路径：
+#   /<agentSource>/<spaceId>/v1/chat/completions  （OpenAI Chat Completions）
+#   /<agentSource>/<spaceId>/v1/messages         （Anthropic Messages）
+#   /v1/responses、/<agentSource>/<spaceId>/v1/responses、
+#   /proxy/<spaceId>/v1/responses （原生 OpenAI Responses）
+#   Responses 的 input/instructions/未知 JSON 字段与 model 别名均保持语义；
+#   JSON/SSE 响应透明返回。启用 sessionInit 时 Team/Agent/Task 与 session
+#   header 会经当前用户可见资源校验，缺少有效绑定返回 409。
+#   Chat/Messages 的无交互客户端仍应持续携带 x-team-id / x-agent-id /
+#   x-task-id 与 x-conversation-id，否则既有 session init/注入可能被跳过。
 #
 # 模块间依赖：
 #   sessionInit 依赖 coreSkill（内核 8420 拉取 team/agent/task 列表） + 状态存储
@@ -29,11 +43,14 @@ server:
 
 # ── 上游 LLM 服务（默认兜底） ──────────────────────────────────────────────────
 upstream:
-  # 上游 OpenAI-compatible API 地址（/v1/chat/completions 会由 proxy 自动拼接）
+  # 上游 OpenAI-compatible API 基地址；Chat handler 会拼接 /chat/completions，
+  # Responses handler 会拼接 /responses（以及 /responses/compact、/models 等）。
+  # 原生 Responses 直通要求该上游本身支持 Responses JSON/SSE，不做协议转换。
   # 也支持完整路径如 https://llm-upstream.example.com/v2/
   url: https://tokenhub.example.com/v1
-  # 若非空，则替换所有转发请求中的 Authorization: Bearer <apiKey>。
-  # 留空则透传客户端原始 API Key。
+  # Chat/Messages 的空 apiKey 可透传客户端 key；Responses handler 会移除
+  # 客户端 Authorization/x-api-key，只使用这里或 agents 中配置的上游 key，
+  # 因此原生 Responses 场景建议显式配置服务端 apiKey。
   apiKey: "<YOUR_TOKENHUB_API_KEY>"
 
   # ── Per-Agent 覆盖 ─────────────────────────────────────────────────────────
@@ -60,12 +77,23 @@ upstream:
   #   3. costGuard.anthropicUpstream.url（仅 Anthropic 协议）
   #   4. upstream.url + upstream.apiKey（未命中 agent 时的默认）
   agents: {}
+    # codebuddy:                                           # 推荐给原生 Responses 客户端
+    #   url: "http://127.0.0.1:8317/v1"                  # 例如 CLIProxyAPI / CC Switch
+    #   apiKey: "<CLIPROXYAPI_API_KEY>"                  # 上游 provider key
     # claude-code:                                        # 服务端 key 模式
     #   url: "https://claude-upstream.example.com/v1"
     #   apiKey: "sk-ant-agent-key"
-    # codex:                                              # 客户端 key 透传模式
+    # codex:                                              # Responses 路由已注册
     #   url: "https://codex-upstream.example.com/v1"
-    #   # 不写 apiKey → 透传客户端自己带上来的 key，不走外层兜底
+    #   apiKey: "<CODEX_UPSTREAM_API_KEY>"
+    #   # /codex/<spaceId> 已被 auth/credit 的 service-id 提取器识别；
+    #   # agentSource 应与这里的 upstream profile 名称保持一致。
+    # cc-switch:                                          # 可用，但按自定义路径隔离
+    #   url: "http://127.0.0.1:8317/v1"
+    #   apiKey: "<CC_SWITCH_API_KEY>"
+    # cliproxyapi:                                        # 可用，但按自定义路径隔离
+    #   url: "http://127.0.0.1:8317/v1"
+    #   apiKey: "<CLIPROXYAPI_API_KEY>"
 
 
 # ── 日志 ─────────────────────────────────────────────────────────────────────
@@ -394,6 +422,8 @@ creditPricing:
 # ── 上下文注入（injection pipeline） ─────────────────────────────────────────
 # 在每次 LLM 请求的 system prompt 中注入相关知识/记忆/技能。
 # 注入管道在 session init 完成后执行。
+# 注意：原生 Responses 会复用这条 injection pipeline，并把新增的 system/
+# developer 上下文合并到 top-level instructions；原始 input/tool-call 序列不改。
 # 每个 injector 是一个独立的 Hook，按注册顺序依次执行。
 #
 # 可选 injector：
@@ -446,26 +476,38 @@ injection:
 #
 # 缺省行为（不写这段）：enabled=true, extractors=["skill","tdai-memory"] — 与历史等价。
 # 想"只注入不提取"：extraction.enabled: false 即可，一刀切。
+# 原生 Responses 完成响应时也执行本段对话回流；function_call 中间响应不写最终 L0。
 extraction:
   enabled: true
   extractors: ["skill", "tdai-memory"]
 
 
 # ── 会话初始化（session init） ──────────────────────────────────────────────
-# 用户首次对话时拦截请求，弹出交互式表单引导选择 team → agent → task，
+# 用户首次对话时拦截请求，弹出交互式表单引导选择 team → agent → task；
+# 无交互客户端应通过 header 直接完成绑定，不能依赖表单，
 # 选择完成后从内核拉取 agent/task 详情并注入到 system prompt。
 #
 # 流程：
 #   1. 弹 asset_confirm 对话框：询问用户是否要关联团队资产
 #   2. 选择 team（仅多 team 时弹出）
 #   3. 选择 agent（支持分页）
-#   4. 选择 task（可选，支持分页/跳过）
+#   4. 选择 task（交互式流程可跳过；无交互 header 直登需要 task_id）
 #   5. 注册会话 → 注入 agent/task 上下文到 system prompt
+#
+# 原生 Responses 也接入该流程：无交互请求必须携带有效 Team/Agent/Task 与
+# session key；`previous_response_id` 只通过持久化映射恢复真实 session，不作为
+# 永久 session ID。无效或缺失绑定返回结构化 409，不进入上游。
 #
 # 状态存储：默认 Redis（redis.enabled=true）；启用 storage.enabled=true 后走
 # ProxyStorage（COS/SQLite/FS）。都不启用则回落 SQLite 单实例本地存储。
 # team/agent/task 列表来自内核 MetadataClient（复用 skill 段配置）。
 # 用户身份由 auth/verify 一跳确定；未通过鉴权/无法识别用户 → 直接 bypass session init。
+#
+# session 绑定键：spaceId + authenticated user_id + agentSource + sessionId。
+# sessionId 按优先级取：x-conversation-id、x-session-id、
+# x-claude-code-session-id、x-chat-id、x-thread-id；客户端必须在每轮请求
+# （包括 tool-call follow-up）中保持同一个值。没有这些 header 时，即使身份
+# header 存在，也会跳过 session init 与 session 级注入。
 sessionInit:
   enabled: true             # 是否启用会话初始化
   maxRetries: 3             # 表单解析失败最大重试次数，超出后 bypass（跳过 session init）
@@ -479,11 +521,13 @@ sessionInit:
   injectAgentContext: true  # false = 不注入 [Agent] 段（id/name/description/prompt）
   injectTaskContext: true   # false = 不注入 [Task] 段（id/name/description/goal）
   # header 自动预选：首轮请求头已带身份字段时，去列表里校验存在性，命中则跳过对应选择步骤。
+  # 无交互客户端要同时提供有效的 team/agent/task；当前直接注册路径中
+  # task_id 是必填的。header 值只接受当前鉴权用户可见的元数据。
   headerAutoSelect:
     enabled: true            # 是否启用 header 预选
     teamHeader: "x-team-id"  # 携带 team_id 的请求头名
     agentHeader: "x-agent-id" # 携带 agent_id 的请求头名
-    taskHeader: "x-task-id"  # 携带 task_id 的请求头名（可选）
+    taskHeader: "x-task-id"  # 携带 task_id 的请求头名（无交互直登必填）
     onMismatch: "form"       # header 值查不到时：form=回退交互表单（默认）| bypass=跳过 session init
 
 

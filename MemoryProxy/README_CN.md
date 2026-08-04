@@ -1,8 +1,8 @@
 # MemoryProxy
 
-MemoryProxy 是一个**透明的 LLM 请求代理**：把编码 Agent（Claude Code / CodeBuddy 等）原本直连大模型的请求，改为先经过它中转。它在转发前后自动完成会话初始化、记忆注入、对话回流等动作，让 Agent **无需改动一行代码**就能用上 [MemoryCore](../MemoryCore/README_CN.md) 提供的团队记忆、Skill 和 Knowledge。
+MemoryProxy 是一个**透明的 LLM 请求代理**：把编码 Agent（Claude Code / CodeBuddy 等）原本直连大模型的请求，改为先经过它中转。Chat/Messages 请求可执行会话初始化、记忆注入和对话回流；原生 Responses 路由则保持上游协议并旁路观测用量，让 Agent **无需改动一行代码**就能用上 [MemoryCore](../MemoryCore/README_CN.md) 提供的团队记忆、Skill 和 Knowledge。
 
-对客户端和上游模型来说，它是“透明”的——不改变任何协议，原样转发 OpenAI `/v1/chat/completions` 和 Anthropic `/v1/messages`，只是在中转的这一进一出里，顺手做了这些事：**会话初始化、上下文注入、对话回流、鉴权与用量上报**。
+对客户端和上游模型来说，它是“透明”的——保持 OpenAI Chat Completions 与 Anthropic Messages 的协议格式，并提供原生 OpenAI Responses `/v1/responses` 的独立转发通道。Chat/Messages 与 Responses 都可复用**会话初始化、上下文注入、限流、用量和最终 L0/Skill 回流**；详见[协议与路径兼容性](#协议与路径兼容性)。
 
 > 一句话分工：MemoryProxy 管“接入与转发”，MemoryCore 管“记忆的存储与处理”。Proxy 自身不落记忆数据，所有 Memory / Skill / Knowledge 读写都经 MemoryCore Gateway（默认 `:8420`）完成。整体产品定位见仓库根 [README_CN.md](../README_CN.md)。
 
@@ -13,7 +13,8 @@ MemoryProxy 是一个**透明的 LLM 请求代理**：把编码 Agent（Claude C
         │  OpenAI / Anthropic 协议（不改动）
         ▼
    MemoryProxy :8096        ← 本项目（LLM 请求代理）
-        │  会话初始化 / 注入 / 回流 / 鉴权 / 上报
+        │  Chat/Messages：会话初始化 / 注入 / 回流
+        │  Responses：鉴权 / session / 注入 / 转发 / 上报
         ├─────────────► 上游 LLM（TokenHub / OpenAI-compatible）
         │
         └─ HTTP API ─► MemoryCore Gateway :8420
@@ -24,16 +25,17 @@ MemoryProxy 是一个**透明的 LLM 请求代理**：把编码 Agent（Claude C
 
 ## 核心能力
 
-- **会话初始化**：首次对话时拦截请求，通过交互式表单引导用户选择 team → agent → task，完成后把 agent/task 上下文注入 system prompt。支持从请求头（`x-team-id` / `x-agent-id` / `x-task-id`）自动预选。
-- **上下文注入**：把 Skill、Knowledge、Memory L2/L3 等按需注入 system prompt；L0/L1 通过只读工具接口暴露给模型主动查询，避免破坏上游 KV cache。
-- **对话回流（提取）**：每轮真人对话结束时，把对话切片同步发到 MemoryCore `/v3/skill/conversation/add`（Skill 归档）并写入 L0 短期记忆，供 core 侧后台抽取。
+- **会话初始化**：在 Chat/Messages pipeline 中，首次对话时拦截请求，通过交互式表单引导用户选择 team → agent → task，完成后把 agent/task 上下文注入 system prompt。支持从请求头（`x-team-id` / `x-agent-id` / `x-task-id`）自动预选。
+- **上下文注入**：在 Chat/Messages pipeline 中，把 Skill、Knowledge、Memory L2/L3 等按需注入 system prompt；L0/L1 通过只读工具接口暴露给模型主动查询，避免破坏上游 KV cache。
+- **对话回流（提取）**：在 Chat/Messages pipeline 中，每轮真人对话结束时，把对话切片同步发到 MemoryCore `/v3/skill/conversation/add`（Skill 归档）并写入 L0 短期记忆，供 core 侧后台抽取。
 - **鉴权与身份**：调用 MemoryCore `POST /v3/meta/auth/verify` 校验 `x-tdai-user-key`，解析出 `user_id` 作为全链路用户标识；`spaceId`（memory 实例 id）从 `/proxy/<spaceId>/...` 路径自动提取。
+- **原生 Responses 转发**：支持 `/v1/responses` 以及 agent/space、legacy `/proxy/<spaceId>` 变体，保留原始 JSON 请求（包括 `input`、`instructions` 和未知字段），透明转发 JSON/SSE 响应并旁路观测用量。
 - **系统用户短路透传**：内部服务账号（如 memory / wiki 内部调用）命中后跳过 session init 和注入，只做透明转发 + 计费。
 - **Skill Bridge / Memory Bridge**：反向代理 MemoryCore 的 skill / memory HTTP 工具，转发时注入 `serviceToken`，避免凭据出现在 LLM 可见的 prompt 中。
 - **统一存储抽象（ProxyStorage）**：会话初始化状态、注入缓存与 Skill 状态（`inj:*` / `sk:*` / `vpin:*`）支持 Redis、COS（kernel-sts）、SQLite、FS、Memory 五种后端，多节点部署首选 COS。
 - **Input TPM / QPM 限流**：按 `spaceId × 最终模型` 在 Redis 上做 60 秒滑动窗口限流，可通过 `/v3/admin/rate-limits` 动态调整。
 - **可观测与用量上报**：Opik trace、Langfuse（一个 trace = 一个 turn）、ClickHouse（按 turn 记录 token 明细）三路互相独立，任一失败不影响业务。
-- **Credit 计费上报**：每次上游响应完成后按定价表计算 CreditDelta 上报到计费服务；仅识别路径带 `/proxy/<spaceId>/` 的请求。
+- **Credit 计费上报**：每次上游响应完成后按定价表计算 CreditDelta 上报到计费服务；仅识别带 spaceId 的已知路径。
 - **多节点部署**：结合外部 gateway 与 COS 后端支持多实例水平扩展；`/skill-bridge` 与 `/memory-bridge` 前缀由 gateway 原样透传到 proxy 实例。
 
 ## 请求处理流程
@@ -163,7 +165,7 @@ npm run dev:config
 
 ## 客户端配置
 
-把编码 Agent 的上游地址指向本代理，其余字段（`apiKey`、`model` 等）保持不变。请求路径推荐带上 `spaceId`（memory 实例 id），proxy 会自动提取用于鉴权、注入与计费。
+把编码 Agent 的上游地址指向本代理，其余字段（`apiKey`、`model` 等）保持不变。请求路径推荐带上 `spaceId`（memory 实例 id），proxy 会提取它用于鉴权和上报；现有 Chat/Messages pipeline 还会用它隔离 session 与注入状态。
 
 OpenAI 兼容客户端：
 
@@ -183,12 +185,154 @@ Anthropic Messages 客户端：
 }
 ```
 
+### 协议与路径兼容性
+
+MemoryProxy 有独立的原生 Responses 转发通道，主要路径包括：
+
+- OpenAI Chat Completions：`POST /<agentSource>/<spaceId>/v1/chat/completions`
+- Anthropic Messages：`POST /<agentSource>/<spaceId>/v1/messages`
+- OpenAI Responses：`POST /v1/responses`
+- Agent/space Responses：`POST /<agentSource>/<spaceId>/v1/responses`（例如 `/codebuddy/<spaceId>/v1/responses` 或 `/codex/<spaceId>/v1/responses`）
+- Legacy Responses：`POST /proxy/<spaceId>/v1/responses`
+
+同一组显式 Responses 路由还包括 `/v1/responses/compact`、`/v1/models`、
+`/v1/alpha/search` 及相应的 agent/space、legacy 前缀；`models` 使用 `GET`，
+其余列出的 helper 路径使用 `POST`。
+
+当启用 auth 和 credit reporting 时，直接 Responses 客户端可以使用
+`codebuddy`、`codex` 或其它已配置的 `agentSource`；路径提取器会识别这些
+agent 对应的 spaceId。Claude Code 的 Anthropic 客户端使用 `claude-code`。旧的
+`/proxy/<spaceId>/...` 前缀仍保留。
+
+对于 `POST /.../responses`，handler 保持 Responses JSON 形状，透传
+`input`、顶层 `instructions`、`previous_response_id`、未知字段和模型别名，
+不转换为 Chat。启用 session 或 memory injection 时，只会追加服务端拥有的
+`instructions` overlay，原始 input/tool-call 序列保持不变。非流式响应保留
+上游 status/body 和相关 header；SSE 按原始字节透明转发，解析器旁路观测
+usage、状态、拒答和 function-call 参数，不改变流内容。凭据和内部身份 header
+不会转发给 provider。
+
+原生 Responses handler 与 Chat/Messages 使用不同 wire adapter，但复用共享的
+session 和 memory 服务。启用 `sessionInit.enabled=true` 后，会校验当前鉴权
+用户可见的 Team/Agent/Task，注册或恢复 Codex session，通过
+`previous_response_id` 映射恢复真实 session；缺少无交互绑定时返回结构化 409。
+配置的注入块会合并到 `instructions`，完成响应可去重写入一次 L0 并触发 Skill
+提取。客户端凭据和内部身份 header 只用于 MemoryProxy，不会发送给 provider。
+
+### 无交互客户端：Header 与 session 绑定
+
+对于现有 Chat/Messages session pipeline，无交互客户端应在首个请求及每次
+tool-loop 后续请求中都携带以下 header：
+
+```http
+Authorization: Bearer <业务用户 user_key>
+x-team-id: <team_id>
+x-agent-id: <agent_id>
+x-task-id: <task_id>
+x-conversation-id: <稳定的会话标识>
+```
+
+`team_id`、`agent_id`、`task_id` 会按当前鉴权用户可见的元数据列表校验，不能
+盲信 header。启用 `sessionInit.headerAutoSelect.enabled=true` 后，三个身份
+header 都有效且带有有效 session header，即可让 Chat/Messages 或 Responses
+handler 跳过交互式表单直接注册 session。Responses 缺少或不匹配绑定时返回
+结构化 409，不会把这些 header 转发给 provider。
+
+Session 绑定键实际等价于：
+
+```text
+(spaceId, authenticated user_id, agentSource, sessionId)
+```
+
+`sessionId` 按以下顺序取值：`x-tdai-session-key`、Codex/session headers、
+`prompt_cache_key`、`conversation.id`，最后才使用有 scope 的
+`previous_response_id` 映射。同一段对话复用同一个值，新对话生成新值。启用
+Responses session-init 时，缺少 Team/Agent/Task/session 绑定会被拒绝，不会静默
+bypass。
+
+### Codex
+
+Codex 可以直接使用原生 Responses 路径，provider 可以这样配置：
+
+```toml
+# ~/.codex/config.toml — Codex → MemoryProxy → 支持 Responses 的上游
+model = "<memoryproxy-model>"
+model_provider = "memory-proxy"
+
+[model_providers.memory-proxy]
+name = "MemoryProxy"
+base_url = "http://127.0.0.1:8096/codebuddy/<spaceId>/v1"
+env_key = "MEMORY_PROXY_API_KEY"
+wire_api = "responses"
+requires_openai_auth = true
+http_headers = {
+  "x-team-id" = "<team_id>",
+  "x-agent-id" = "<agent_id>",
+  "x-task-id" = "<task_id>",
+  "x-conversation-id" = "<stable-conversation-id>"
+}
+```
+
+`MEMORY_PROXY_API_KEY` 是 MemoryProxy 接受的业务用户 key。上游 provider key
+要在 MemoryProxy 的 `upstream.agents.codebuddy.apiKey`（或全局
+`upstream.apiKey`）中单独配置；客户端 key 用于 MemoryProxy 鉴权，不会被
+Responses handler 转发到上游。四个自定义 header 要在 tool call 间保持稳定。
+`/codex/<spaceId>/v1` 也是已注册路由，auth/credit 的 space 提取器会识别
+`codex`；实际使用哪个 agent 名称应与上游 profile 配置保持一致。
+
+### CC Switch
+
+如果 CC Switch 作为 MemoryProxy 前面的客户端/provider switch，选择其原生
+**OpenAI Responses** 模式，并将 provider base URL 设为：
+
+```text
+http://127.0.0.1:8096/codebuddy/<spaceId>/v1
+```
+
+填写业务用户 API Key，并保留 `x-team-id`、`x-agent-id`、`x-task-id`、
+`x-conversation-id`。这一段不需要启用 Responses → Chat 转换：MemoryProxy
+已经接受原生 Responses，并将其转发给支持 Responses 的上游。如果 CC Switch
+反过来作为 MemoryProxy 的上游，则把 `upstream.agents.codebuddy.url` 指向
+它的 OpenAI-compatible `/v1` endpoint，并确认该 endpoint 提供 `/v1/responses`
+以及 JSON/SSE。
+
+### CLIProxyAPI
+
+CLIProxyAPI 可以作为 MemoryProxy 的上游，通过它标准的 OpenAI-compatible
+`/v1` endpoint 转发。原生 Responses 场景下，选中的 CLIProxyAPI provider
+必须支持 `/v1/responses` 以及 JSON/SSE：
+
+```yaml
+# MemoryProxy/config.yaml
+upstream:
+  agents:
+    codebuddy:
+      url: "http://127.0.0.1:8317/v1"
+      apiKey: "<CLIProxyAPI-api-key>"
+```
+
+如果 CLIProxyAPI 作为面向 Codex 的前置 sidecar，则把它的 custom provider
+base URL 设为 `http://127.0.0.1:8096/codebuddy/<spaceId>/v1`，选择 OpenAI
+Responses wire format，并保留四个 Team/Agent/Task/session header。原生
+Responses 路径不需要 Responses → Chat 转换层。
+
+## 已知限制
+
+- 原生 Responses 复用 session、injection、限流、用量和最终 L0/Skill hook；但 cost-guard 路由扩展以及 Opik/Langfuse generation span 还没有 Responses 专用适配，上游选择使用 agent/global 配置。
+- Responses 上游必须实现对应的 Responses endpoint；MemoryProxy 不会把 Responses 转换为 Chat Completions 或 Anthropic Messages。
+- 启用 auth 时，根路径 `/v1/responses` 没有 `spaceId` 可供 `auth/verify` 使用；请使用 `/codebuddy/<spaceId>/v1/responses`、`/codex/<spaceId>/v1/responses` 或 `/proxy/<spaceId>/v1/responses`。
+- `input`、`instructions`、`previous_response_id`、未知 JSON 字段和模型别名会保持语义。启用 session/memory injection 时，服务端会有意追加 `instructions` 并重新序列化请求。
+- Responses 请求中的 Team/Agent/Task 与 session header 会按当前用户可见资源校验和绑定；缺少或不匹配时返回结构化 409。直接 header 注册要求有效 task id，交互式表单仍可按既有 Chat/Messages 流程使用。
+- 用量日志与 Credit 上报都是 best effort。未知模型别名可能正常转发，但没有对应定价记录；Credit 提取同样依赖可识别的带 spaceId 路径。
+
 ## 主要 HTTP 端点
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/proxy/<spaceId>/v1/chat/completions` | OpenAI 兼容主模型调用（带 memory 实例 id） |
 | `POST` | `/proxy/<spaceId>/v1/messages` | Anthropic Messages 主模型调用 |
+| `POST` | `/proxy/<spaceId>/v1/responses` | 原生 OpenAI Responses 透明转发（JSON/SSE） |
+| `POST` | `/<agent>/<spaceId>/v1/responses` | 原生 Responses 透明转发；启用 auth 时推荐 `codebuddy` |
 | `POST` | `/v1/messages` | Anthropic Messages API（无 spaceId 兜底） |
 | `POST` | `/*` | OpenAI 兼容聊天接口（catch-all） |
 | `ALL`  | `/skill-bridge/**` | 反向代理 MemoryCore skill HTTP 工具 |

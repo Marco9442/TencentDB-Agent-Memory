@@ -9,7 +9,7 @@
     "outDir": "dist",
     "resolveJsonModule": true,
     "paths": {
-      "@context-proxy/cost-guard": ["./packages/cost-guard/src/index.ts"]
+      "@context-proxy/cost-guard": ["./src/cost-guard.d.ts"]
     }
   },
   "include": ["src/**/*"],

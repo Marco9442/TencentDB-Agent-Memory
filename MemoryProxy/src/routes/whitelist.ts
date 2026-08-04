@@ -58,6 +58,13 @@ export const WHITELIST_ENDPOINTS: readonly WhitelistEndpoint[] = [
     supportsStream: true,
     isPrimary: true,
   },
+  {
+    pathSuffix: "/v1/responses",
+    upstreamEndpoint: "/responses",
+    protocol: "openai",
+    supportsStream: true,
+    isPrimary: true,
+  },
   // ── 辅助端点（由 handleAuxiliaryEndpoint 处理，不走路由）─────────
   {
     pathSuffix: "/v1/messages/count_tokens",
@@ -87,6 +94,27 @@ export const WHITELIST_ENDPOINTS: readonly WhitelistEndpoint[] = [
     supportsStream: false,
     isPrimary: false,
   },
+  {
+    pathSuffix: "/v1/responses/compact",
+    upstreamEndpoint: "/responses/compact",
+    protocol: "openai",
+    supportsStream: false,
+    isPrimary: false,
+  },
+  {
+    pathSuffix: "/v1/models",
+    upstreamEndpoint: "/models",
+    protocol: "openai",
+    supportsStream: false,
+    isPrimary: false,
+  },
+  {
+    pathSuffix: "/v1/alpha/search",
+    upstreamEndpoint: "/alpha/search",
+    protocol: "openai",
+    supportsStream: false,
+    isPrimary: false,
+  },
 ] as const;
 
 /** 按长度降序排列的缓存，避免每次匹配都重新排序。 */
@@ -103,7 +131,13 @@ const PROXY_PREFIX_RE = /^\/proxy\/[^/]+/;
  * lookahead `(?=/v1/)` 确保白名单入口 `/v1/messages` 自身不会被误剥。
  * agent 段限定为已知名字，避免误伤路径中恰好有 "v1" 字面量的其它请求。
  */
-const AGENT_PREFIX_RE = /^\/(claude-code|codebuddy|cursor|anthropic|openai)(?:\/[^/]+)?(?=\/v1\/)/i;
+const AGENT_PREFIX_RE = /^\/(claude-code|codebuddy|cursor|anthropic|openai|codex)(?:\/[^/]+)?(?=\/v1\/)/i;
+
+/** Agent-prefixed Responses aliases without `/v1`; do not consume the protocol segment as a spaceId. */
+const AGENT_SHORT_RESPONSES_PREFIX_RE = /^\/(claude-code|codebuddy|cursor|anthropic|openai|codex)(?:\/(?!v1(?:\/|$)|responses(?:\/|$)|models(?:\/|$)|alpha(?:\/|$))[^/]+)?(?=\/(?:responses(?:\/|$)|models(?:\/|$)|alpha\/))/i;
+
+/** Responses clients also use the short aliases without a `/v1` segment. */
+const SHORT_RESPONSES_ALIAS_RE = /^\/(?:responses(?:\/|$)|models(?:\/|$)|alpha\/)/i;
 
 /**
  * `/cost-guard` marker 正则：位于 `/{agent}/{spaceId}` 之后的独立 segment。
@@ -180,7 +214,14 @@ export function normalizeWhitelistRequestPath(requestPath: string): string {
   const withoutCostGuard = withoutQuery.replace(COST_GUARD_MARKER_RE, "");
   const withoutAnalyse = withoutCostGuard.replace(ANALYSE_MARKER_RE, "");
   const withoutProxy = withoutAnalyse.replace(PROXY_PREFIX_RE, "");
-  return withoutProxy.replace(AGENT_PREFIX_RE, "");
+  const withoutPrefix = withoutProxy
+    .replace(AGENT_PREFIX_RE, "")
+    .replace(AGENT_SHORT_RESPONSES_PREFIX_RE, "");
+  const shortAlias = withoutPrefix.match(SHORT_RESPONSES_ALIAS_RE)?.[0];
+  if (shortAlias) {
+    return `/v1/${withoutPrefix.slice(1)}`;
+  }
+  return withoutPrefix;
 }
 
 /**

@@ -15,6 +15,7 @@ import type {
   SessionInitState,
   SessionRegistrationData,
   TaskDetail,
+  TaskInTeam,
   TeamOption,
 } from "../types.js";
 import { DEFAULT_TASK_LABEL } from "../types.js";
@@ -96,7 +97,7 @@ async function fetchTeamsAndAgents(
         metadataClient.listAgents(t.team_id, userId),
         metadataClient.listTasks(t.team_id),
       ]);
-      const tasks = tasksRaw.map((tk) => ({
+      const tasks: TaskInTeam[] = tasksRaw.map((tk) => ({
         task_id: tk.task_id,
         task_name: tk.title,
       }));

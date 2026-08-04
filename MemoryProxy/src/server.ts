@@ -12,6 +12,7 @@ import { createRateLimitHandlers } from "./routes/rate-limits.js";
 import { hasCostGuardMarker } from "./routes/whitelist.js";
 import { tryActivateStorage, tryActivateRedis } from "./injection/index.js";
 import { getEffectiveBackend } from "./storage/factory.js";
+import { registerResponsesRoutes } from "./responses/index.js";
 import type { ProxyConfig } from "./types.js";
 
 export function createApp(config: ProxyConfig): Hono {
@@ -194,6 +195,28 @@ export function createApp(config: ProxyConfig): Hono {
   app.post("/proxy/:spaceId/v1/embeddings", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/proxy/:spaceId/v1/completions", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/proxy/:spaceId/v1/moderations", (c) => handleAuxiliaryEndpoint(c, config));
+
+  // OpenAI Responses API and its explicit helper endpoints. Keep this before
+  // the legacy proxy/catch-all routes so unknown POSTs still use Chat.
+  registerResponsesRoutes(app, config);
+
+  // A misspelled Responses sub-route must be a clear 404, not a Chat
+  // Completions attempt with an unrelated body contract.
+  const rejectUnknownResponses = (c: Parameters<typeof handleChatCompletions>[0]) =>
+    c.json({
+      error: {
+        type: "invalid_request_error",
+        code: "unknown_responses_endpoint",
+        message: "Unknown OpenAI Responses endpoint",
+      },
+    }, 404);
+  app.post("/v1/responses/*", rejectUnknownResponses);
+  app.post("/responses/*", rejectUnknownResponses);
+  app.post("/:agent/:spaceId/v1/responses/*", rejectUnknownResponses);
+  app.post("/:agent/:spaceId/responses/*", rejectUnknownResponses);
+  app.post("/proxy/:spaceId/v1/responses/*", rejectUnknownResponses);
+  app.post("/proxy/:spaceId/responses/*", rejectUnknownResponses);
+
   app.post("/proxy/:spaceId/*", (c) => handleChatCompletions(c, config));
 
   // OpenAI-compatible chat completions (catch-all for any remaining POST paths)

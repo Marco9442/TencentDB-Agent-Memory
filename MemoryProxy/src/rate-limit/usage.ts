@@ -13,7 +13,7 @@ export function getActualInputTokens(
 ): number {
   if (!usage) return 0;
   if (protocol === "openai") {
-    return numberField(usage.prompt_tokens);
+    return numberField(usage.prompt_tokens ?? usage.input_tokens);
   }
   return numberField(usage.input_tokens)
     + numberField(usage.cache_read_input_tokens)
