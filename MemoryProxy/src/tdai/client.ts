@@ -89,6 +89,23 @@ export class TdaiClient {
   }
 
   async addConversation(identity: TdaiIdentity, messages: TdaiMessage[]): Promise<void> {
+    await this.addConversationWithMode(identity, messages, "soft");
+  }
+
+  /**
+   * Strict L0 write path. Existing recall/injection callers keep the soft
+   * semantics of addConversation(); only final Responses persistence uses this
+   * entry point so withL0Retry can observe transient failures.
+   */
+  async addConversationStrict(identity: TdaiIdentity, messages: TdaiMessage[]): Promise<void> {
+    await this.addConversationWithMode(identity, messages, "throw");
+  }
+
+  private async addConversationWithMode(
+    identity: TdaiIdentity,
+    messages: TdaiMessage[],
+    failureMode: "soft" | "throw",
+  ): Promise<void> {
     if (!this.isEnabled() || !this.config.writeL0 || messages.length === 0) return;
 
     const chunkedMessages = chunkConversationMessages(messages);
@@ -116,6 +133,7 @@ export class TdaiClient {
         identity.sessionId,
         identity.taskId,
         { includeSession: true, includeTask: true },
+        failureMode,
       );
     }
   }
@@ -265,6 +283,7 @@ export class TdaiClient {
     sessionId: string,
     taskId: string | undefined,
     options: { includeSession: boolean; includeTask: boolean } = { includeSession: true, includeTask: true },
+    failureMode: "soft" | "throw" = "soft",
   ): Promise<T> {
     const base = this.config.endpoint.replace(/\/$/, "");
     const controller = new AbortController();
@@ -287,11 +306,34 @@ export class TdaiClient {
         headers,
         body: JSON.stringify(stripUndefined(body)),
       });
-      if (!res.ok) return {} as T;
-      const envelope = await res.json() as TdaiEnvelope<T>;
-      if (typeof envelope.code === "number" && envelope.code !== 0) return {} as T;
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => "");
+        throw new Error(`tdai POST ${path} HTTP ${res.status}: ${errorText.slice(0, 500)}`);
+      }
+
+      let envelope: TdaiEnvelope<T>;
+      try {
+        envelope = await res.json() as TdaiEnvelope<T>;
+      } catch (error) {
+        throw new Error(
+          `tdai POST ${path} invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+        throw new Error(`tdai POST ${path} malformed envelope`);
+      }
+      if (typeof envelope.code !== "number") {
+        if (failureMode === "throw") {
+          throw new Error(`tdai POST ${path} malformed envelope: missing code`);
+        }
+        return (envelope.data ?? {}) as T;
+      }
+      if (envelope.code !== 0) {
+        throw new Error(`tdai POST ${path} envelope code=${envelope.code} msg=${envelope.message ?? ""}`);
+      }
       return (envelope.data ?? {}) as T;
-    } catch {
+    } catch (error) {
+      if (failureMode === "throw") throw error;
       return {} as T;
     } finally {
       clearTimeout(timer);

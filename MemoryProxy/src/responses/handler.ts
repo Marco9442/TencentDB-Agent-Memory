@@ -29,10 +29,11 @@ import { ProxyStorageResponsesRoundStore, InMemoryResponsesRoundStore, type Resp
 import { enforceRateLimit, isRateLimitExceededError, recordInputTokenUsage } from "../rate-limit/guard.js";
 import { TdaiClient } from "../tdai/client.js";
 import { deriveTdaiIdentity } from "../tdai/identity.js";
-import { extractLatestUserMessage, recordTdaiTurn } from "../tdai/recorder.js";
-import { withL0Retry } from "../tdai/pending-writes.js";
+import { extractLatestUserMessage } from "../tdai/recorder.js";
+import { trackWrite, withL0Retry } from "../tdai/pending-writes.js";
 import { isExtractionAllowed } from "../extraction-gate.js";
 import { triggerSkillExtractIfReady } from "../skill/handler-glue.js";
+import { log } from "../report/log.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -121,6 +122,64 @@ function responseVisibleText(parsed: ParsedResponsesJson | ParsedResponsesStream
     const record = item as Record<string, unknown>;
     return contentText(record.content);
   }).filter(Boolean).join("\n");
+}
+
+function firstRealUserMessage(messages: JsonObject[]): ReturnType<typeof extractLatestUserMessage> {
+  for (const message of messages) {
+    const user = extractLatestUserMessage([message]);
+    if (user) return user;
+  }
+  return null;
+}
+
+function toolOutputIds(messages: JsonObject[]): Set<string> {
+  return new Set(
+    messages
+      .filter((message) => message.role === "tool")
+      .map((message) => message.tool_call_id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0),
+  );
+}
+
+function responseAssistantMessage(
+  parsed: ParsedResponsesJson | ParsedResponsesStream,
+  assistantText: string,
+): JsonObject | null {
+  if (parsed.functionCalls.length > 0) {
+    return {
+      role: "assistant",
+      content: null,
+      tool_calls: parsed.functionCalls.map((call) => ({
+        id: call.call_id ?? call.id,
+        type: "function",
+        function: { name: call.name, arguments: call.arguments ?? "" },
+      })),
+    };
+  }
+  return assistantText ? { role: "assistant", content: assistantText } : null;
+}
+
+function sameMessage(left: JsonObject, right: JsonObject): boolean {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
+function mergeRoundMessages(
+  predecessor: Array<Record<string, unknown>> | undefined,
+  current: JsonObject[],
+  assistantMessage: JsonObject | null,
+): Array<Record<string, unknown>> {
+  const result: Array<Record<string, unknown>> = (predecessor ?? []).map((message) => ({ ...message }));
+  for (const message of current) {
+    if (!result.some((existing) => sameMessage(existing, message))) result.push({ ...message });
+  }
+  if (assistantMessage && !result.some((existing) => sameMessage(existing, assistantMessage))) {
+    result.push({ ...assistantMessage });
+  }
+  return result;
 }
 
 function textFromChatMessages(messages: JsonObject[], role: "system" | "developer"): string[] {
@@ -241,6 +300,7 @@ interface PreparedResponsesRequest {
   sessionInfo?: Record<string, unknown> | null;
   responseSessionMap?: CodexResponseSessionMap;
   roundStore?: ResponsesRoundStore;
+  predecessorState?: ResponsesRoundState | null;
   agentSource: string;
 }
 
@@ -306,6 +366,10 @@ async function prepareResponsesRequest(
   } catch {
     roundStore = new InMemoryResponsesRoundStore(roundScope);
   }
+
+  const predecessorState = request.previousResponseId
+    ? await roundStore.getState(request.previousResponseId)
+    : null;
 
   let sessionInfo: Record<string, unknown> | null | undefined;
   if (config.sessionInit.enabled) {
@@ -446,11 +510,20 @@ async function prepareResponsesRequest(
     sessionInfo,
     responseSessionMap: responseMap,
     roundStore,
+    predecessorState,
     agentSource,
   };
 }
 
-async function finalizeResponsesLifecycle(args: {
+interface PublishedResponsesLifecycle {
+  id?: string;
+  state?: ResponsesRoundState;
+  assistantText: string;
+  finalCandidate: boolean;
+  publicationTasks: Promise<unknown>[];
+}
+
+function publishResponsesCompletion(args: {
   config: ProxyConfig;
   path: string;
   modelId: string;
@@ -468,7 +541,107 @@ async function finalizeResponsesLifecycle(args: {
   sessionInfo?: Record<string, unknown> | null;
   responseSessionMap?: CodexResponseSessionMap;
   roundStore?: ResponsesRoundStore;
+  predecessorState?: ResponsesRoundState | null;
+}): PublishedResponsesLifecycle {
+  const publicationTasks: Promise<unknown>[] = [];
+  const id = responseId(args.parsed);
+  const status = args.parsed.status;
+  const streamDone = "done" in args.parsed ? args.parsed.done : true;
+  const final = status === "completed" || (!status && streamDone);
+  const functionCallIds = args.parsed.functionCalls
+    .map((call) => call.call_id ?? call.id)
+    .filter((callId): callId is string => !!callId);
+  const finalCandidate = final && functionCallIds.length === 0;
+
+  if (id && args.responseSessionMap && args.sessionKey) {
+    // The map implementation is write-through: the local publication happens
+    // before this promise reaches its first await.
+    publicationTasks.push(args.responseSessionMap.put(id, args.sessionKey));
+  }
+
+  let state: ResponsesRoundState | undefined;
+  if (id && args.sessionKey && args.roundStore) {
+    const predecessor = args.predecessorState;
+    const currentUser = firstRealUserMessage(args.messages);
+    const outputIds = toolOutputIds(args.messages);
+    const pendingCallIds = [...new Set([
+      ...(predecessor?.pendingCallIds ?? []).filter((callId) => !outputIds.has(callId)),
+      ...functionCallIds,
+    ])];
+    const roundComplete = finalCandidate && pendingCallIds.length === 0;
+    const l0Expected = Boolean(
+      args.sessionInfo
+      && args.sessionKey
+      && args.config.tdai.enabled
+      && args.config.tdai.endpoint
+      && args.config.tdai.memory.enabled
+      && args.config.tdai.memory.writeL0
+      && isExtractionAllowed(args.config, "tdai-memory"),
+    );
+    const originalUserInput = predecessor?.originalUserInput?.trim()
+      || currentUser?.content.trim()
+      || "";
+    const assistantText = responseVisibleText(args.parsed);
+    state = {
+      spaceId: args.spaceId,
+      userId: args.userId,
+      agentSource: args.agentSource,
+      sessionKey: args.sessionKey,
+      roundId: id,
+      originalUserInput,
+      pendingCallIds,
+      seenResponseIds: [...new Set([...(predecessor?.seenResponseIds ?? []), id])],
+      conversationMessages: mergeRoundMessages(
+        predecessor?.conversationMessages,
+        args.messages,
+        roundComplete ? null : responseAssistantMessage(args.parsed, assistantText),
+      ),
+      ...(roundComplete
+        ? {
+            finalResponseId: id,
+            ...(l0Expected ? { l0Status: "pending" as const } : {}),
+          }
+        : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    publicationTasks.push(args.roundStore.putState(id, state));
+  }
+
+  return {
+    id,
+    state,
+    assistantText: responseVisibleText(args.parsed),
+    finalCandidate: !!state && finalCandidate && state.pendingCallIds.length === 0,
+    publicationTasks,
+  };
+}
+
+export async function finalizeResponsesLifecycle(args: {
+  config: ProxyConfig;
+  path: string;
+  modelId: string;
+  keyId: string;
+  sessionKey?: string;
+  userId: string;
+  userKey: string;
+  agentSource: string;
+  spaceId: string;
+  upstreamUrl: string;
+  status: number;
+  stream: boolean;
+  parsed: ParsedResponsesJson | ParsedResponsesStream;
+  messages: JsonObject[];
+  sessionInfo?: Record<string, unknown> | null;
+  responseSessionMap?: CodexResponseSessionMap;
+  roundStore?: ResponsesRoundStore;
+  predecessorState?: ResponsesRoundState | null;
 }): Promise<void> {
+  const publication = publishResponsesCompletion(args);
+
+  // Keep every publication write in the tracked lifecycle, but do not make
+  // publication itself wait for durable storage before the SSE closes.
+  await Promise.allSettled(publication.publicationTasks);
+
   const usage = extractUsage(args.parsed);
   await recordUsage(
     args.config,
@@ -489,59 +662,64 @@ async function finalizeResponsesLifecycle(args: {
     protocol: "openai",
   }).catch(() => undefined);
 
-  const id = responseId(args.parsed);
-  if (id && args.responseSessionMap && args.sessionKey) {
-    await args.responseSessionMap.put(id, args.sessionKey).catch(() => undefined);
-  }
+  const id = publication.id;
+  if (!publication.finalCandidate || !id || !args.roundStore) return;
 
-  const status = args.parsed.status;
-  const streamDone = "done" in args.parsed ? args.parsed.done : true;
-  const final = status === "completed" || (!status && streamDone);
-  const pendingCallIds = args.parsed.functionCalls
-    .map((call) => call.call_id ?? call.id)
-    .filter((callId): callId is string => !!callId);
-  if (id && args.sessionKey && args.roundStore?.recordState) {
-    const userMessage = extractLatestUserMessage(args.messages);
-    const state: ResponsesRoundState = {
-      spaceId: args.spaceId,
-      userId: args.userId,
-      agentSource: args.agentSource,
-      sessionKey: args.sessionKey,
-      roundId: id,
-      originalUserInput: userMessage?.content ?? "",
-      pendingCallIds,
-      seenResponseIds: [id],
-      ...(final && pendingCallIds.length === 0 ? { finalResponseId: id } : {}),
-      updatedAt: new Date().toISOString(),
-    };
-    await args.roundStore.recordState(state);
-  }
-  if (!final || !id || !args.roundStore || args.parsed.functionCalls.length > 0) return;
-  if (!await args.roundStore.markFinal(id)) return;
-
-  const assistantText = responseVisibleText(args.parsed);
-  if (!assistantText || !args.sessionInfo || !args.sessionKey) return;
+  const assistantText = publication.assistantText;
+  const roundState = publication.state;
+  const userContent = roundState?.originalUserInput?.trim()
+    || firstRealUserMessage(args.messages)?.content
+    || "";
 
   const tdaiClient = createTdaiClient(args.config, args.spaceId);
-  const identity = deriveTdaiIdentity({
-    sessionInfo: args.sessionInfo,
-    userId: args.userId || null,
-    sessionKey: args.sessionKey,
-    userKey: args.userKey || null,
-  });
-  if (tdaiClient && identity && isExtractionAllowed(args.config, "tdai-memory")) {
-    const userMessage = extractLatestUserMessage(args.messages);
-    await withL0Retry(() => recordTdaiTurn(tdaiClient!, identity, userMessage, assistantText))
-      .catch(() => undefined);
+  const identity = tdaiClient
+    ? deriveTdaiIdentity({
+        sessionInfo: args.sessionInfo,
+        userId: args.userId || null,
+        sessionKey: args.sessionKey ?? "",
+        userKey: args.userKey || null,
+      })
+    : null;
+  if (tdaiClient && identity && userContent && assistantText && isExtractionAllowed(args.config, "tdai-memory")) {
+    let claimed = false;
+    try {
+      claimed = await args.roundStore.beginFinal(id);
+      if (claimed) {
+        let l0Succeeded = false;
+        try {
+          await withL0Retry(() => tdaiClient.addConversationStrict(identity, [
+            { role: "user", content: userContent },
+            { role: "assistant", content: assistantText },
+          ]));
+          l0Succeeded = true;
+          await args.roundStore.completeL0(id);
+        } catch (error) {
+          if (!l0Succeeded) {
+            await args.roundStore.releaseFinal(id).catch(() => undefined);
+          }
+          log.warn("responses.l0_write_failed", {
+            responseId: id,
+            error: error instanceof Error ? error.message : String(error),
+            markerPublished: l0Succeeded,
+          });
+        }
+      }
+    } catch (error) {
+      if (claimed) await args.roundStore.releaseFinal(id).catch(() => undefined);
+      log.warn("responses.l0_claim_failed", {
+        responseId: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   if (isExtractionAllowed(args.config, "skill")) {
     await triggerSkillExtractIfReady({
       config: args.config,
-      sessionKey: args.sessionKey,
+      sessionKey: args.sessionKey ?? "",
       agentSource: args.agentSource,
       sessionInfo: args.sessionInfo,
-      inputMessages: args.messages,
+      inputMessages: roundState?.conversationMessages ?? args.messages,
       assistantMessage: { role: "assistant", content: assistantText },
       protocol: "openai",
     }).catch(() => undefined);
@@ -654,6 +832,7 @@ export async function handleResponses(
       sessionInfo: lifecycle.sessionInfo,
       responseSessionMap: lifecycle.responseSessionMap,
       roundStore: lifecycle.roundStore,
+      predecessorState: lifecycle.predecessorState,
     });
     return new Response(body, { status: upstream.status, headers });
   }
@@ -668,14 +847,14 @@ export async function handleResponses(
       }
       controller.enqueue(chunk);
     },
-    async flush() {
+    flush() {
       let parsed: ParsedResponsesStream;
       try {
         parsed = parser.finish();
       } catch {
         return;
       }
-      await finalizeResponsesLifecycle({
+      const task = finalizeResponsesLifecycle({
         config,
         path: c.req.path,
         modelId: request.model,
@@ -693,6 +872,12 @@ export async function handleResponses(
         sessionInfo: lifecycle.sessionInfo,
         responseSessionMap: lifecycle.responseSessionMap,
         roundStore: lifecycle.roundStore,
+        predecessorState: lifecycle.predecessorState,
+      });
+      trackWrite(task).catch((error: unknown) => {
+        log.warn("responses.lifecycle_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
     },
   }));

@@ -143,6 +143,11 @@ interface StoredCodexResponseSession {
   sessionKey: string;
 }
 
+// Continuations can arrive immediately after an SSE EOF, before the durable
+// ProxyStorage write completes. Keep the mapping local first, scoped exactly
+// like the durable key; storage remains the cross-process source of truth.
+const localResponseSessionCache = new Map<string, string>();
+
 export interface CodexResponseSessionMapScope {
   userId: string;
   spaceId?: string;
@@ -170,20 +175,32 @@ export class ProxyStorageCodexResponseSessionMap implements CodexResponseSession
   }
 
   async get(responseId: string): Promise<string | null> {
-    const key = this.key(responseId);
+    const id = clean(responseId);
+    if (!id) return null;
+    const cacheKey = this.cacheKey(id);
+    const cached = localResponseSessionCache.get(cacheKey);
+    if (cached) return cached;
+    const key = this.key(id);
     if (!key) return null;
     try {
       const row = await this.storage.getJSON<StoredCodexResponseSession>(key);
-      return clean(row?.sessionKey) ?? null;
+      const sessionKey = clean(row?.sessionKey);
+      if (sessionKey) localResponseSessionCache.set(cacheKey, sessionKey);
+      return sessionKey ?? null;
     } catch {
       return null;
     }
   }
 
   async put(responseId: string, sessionKey: string): Promise<void> {
-    const key = this.key(responseId);
+    const id = clean(responseId);
     const resolvedSessionKey = clean(sessionKey);
-    if (!key || !resolvedSessionKey) return;
+    if (!id || !resolvedSessionKey) return;
+    const cacheKey = this.cacheKey(id);
+    // Write-through publication is intentionally before the first await.
+    localResponseSessionCache.set(cacheKey, resolvedSessionKey);
+    const key = this.key(id);
+    if (!key) return;
     try {
       await this.storage.putJSON(key, { sessionKey: resolvedSessionKey });
     } catch {
@@ -207,9 +224,17 @@ export class ProxyStorageCodexResponseSessionMap implements CodexResponseSession
       return null;
     }
   }
+
+  private cacheKey(responseId: string): string {
+    return `${this.spaceId}\0${this.userId}\0${this.agentSource}\0${responseId}`;
+  }
 }
 
 export type CodexResponseSessionMapping = CodexResponseSessionMap;
+
+export function __resetCodexResponseSessionMapForTests(): void {
+  localResponseSessionCache.clear();
+}
 
 export interface CodexSessionKeyInput {
   headers?: CodexHeaders;

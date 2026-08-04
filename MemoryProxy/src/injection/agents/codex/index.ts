@@ -36,21 +36,65 @@ function appendToContent(content: unknown, addition: string): unknown {
   if (typeof content === "string") return appendText(content, addition);
   if (!Array.isArray(content)) return undefined;
 
-  const parts = content.map((part) =>
-    part && typeof part === "object" ? { ...(part as Record<string, unknown>) } : part,
-  );
+  return appendToTextPartArray(content, addition);
+}
+
+function appendToTextPartArray(content: unknown[], addition: string): unknown[] | undefined {
+  const parts = [...content];
   for (let i = parts.length - 1; i >= 0; i--) {
     const part = parts[i];
-    if (!part || typeof part !== "object") continue;
+    if (!part || typeof part !== "object" || Array.isArray(part)) continue;
     const record = part as Record<string, unknown>;
-    if (typeof record.text === "string") {
+    if (
+      (record.type === "input_text" || record.type === "text")
+      && typeof record.text === "string"
+    ) {
       parts[i] = { ...record, text: appendText(record.text, addition) };
       return parts;
     }
   }
-
-  // An empty content array has no SDK shape to preserve; leave it untouched.
   return undefined;
+}
+
+function appendToInstructionsArray(instructions: unknown[], addition: string): unknown[] {
+  const next = [...instructions];
+
+  // Prefer the last system/developer message's text, then a top-level text
+  // part. Every untouched item remains the original opaque value.
+  for (let i = instructions.length - 1; i >= 0; i--) {
+    const rawItem = instructions[i];
+    if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) continue;
+    const item = rawItem as Record<string, unknown>;
+    if (item.role === "system" || item.role === "developer") {
+      const content = appendToContent(item.content, addition);
+      if (content !== undefined) {
+        next[i] = { ...item, content };
+        return next;
+      }
+    }
+  }
+
+  for (let i = instructions.length - 1; i >= 0; i--) {
+    const rawItem = instructions[i];
+    if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) continue;
+    const item = rawItem as Record<string, unknown>;
+    if (
+      (item.type === "input_text" || item.type === "text")
+      && typeof item.text === "string"
+    ) {
+      next[i] = { ...item, text: appendText(item.text, addition) };
+      return next;
+    }
+  }
+
+  // The array may contain only opaque/unknown items. Preserve them and add
+  // the smallest Responses-compatible developer message.
+  next.push({
+    type: "message",
+    role: "developer",
+    content: [{ type: "input_text", text: addition }],
+  });
+  return next;
 }
 
 function injectIntoInputRole(
@@ -103,10 +147,10 @@ export function injectCodexInstructions(
         target,
       };
     }
-    const nextInstructions = appendToContent(current, addition);
-    if (nextInstructions === undefined) {
-      return { body, applied: false, target: "none" };
-    }
+    const nextInstructions = Array.isArray(current)
+      ? appendToInstructionsArray(current, addition)
+      : appendToContent(current, addition);
+    if (nextInstructions === undefined) return { body, applied: false, target: "none" };
     return {
       body: { ...body, instructions: nextInstructions },
       applied: true,
