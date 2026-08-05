@@ -50,6 +50,7 @@ import {
   isRateLimitExceededError,
   recordInputTokenUsage,
 } from "./rate-limit/guard.js";
+import { composeUpstreamSignal } from "./common/upstream-signal.js";
 
 /**
  * Build a per-request TdaiClient. `spaceId` (extracted from the request path
@@ -298,6 +299,7 @@ async function forwardWithRetry(
   originalHeaders: Record<string, string>,
   pipe: ReturnType<typeof createPipeline>,
   forwardTimeoutMs: number,
+  requestSignal: AbortSignal,
   sessionKeyForDebug?: string,
   rateLimitContext?: { config: ProxyConfig; instanceId?: string },
 ): Promise<{ resp: Response; retried: boolean }> {
@@ -331,9 +333,7 @@ async function forwardWithRetry(
     headers: upstreamHeaders,
     body: JSON.stringify(upstreamBody),
   };
-  if (forwardTimeoutMs > 0) {
-    fetchOpts.signal = AbortSignal.timeout(forwardTimeoutMs);
-  }
+  fetchOpts.signal = composeUpstreamSignal(requestSignal, forwardTimeoutMs);
 
   if (rateLimitContext) {
     await enforceRateLimit({
@@ -346,6 +346,7 @@ async function forwardWithRetry(
   try {
     upstreamResp = await fetch(target.url, fetchOpts);
   } catch (err: unknown) {
+    if (requestSignal.aborted) throw err;
     if (err instanceof DOMException && err.name === "TimeoutError") {
       pipe.error("FORWARD", `Timeout after ${forwardTimeoutMs / 1000}s`);
     } else {
@@ -356,6 +357,10 @@ async function forwardWithRetry(
 
   if (upstreamResp) {
     pipe.forwardDone(upstreamResp.status);
+  }
+
+  if (requestSignal.aborted) {
+    throw requestSignal.reason ?? new DOMException("The operation was aborted.", "AbortError");
   }
 
   const shouldRetry = target.retryTarget &&
@@ -386,9 +391,7 @@ async function forwardWithRetry(
         headers: retryHeaders,
         body: JSON.stringify(retryBody),
       };
-      if (forwardTimeoutMs > 0) {
-        retryFetchOpts.signal = AbortSignal.timeout(forwardTimeoutMs);
-      }
+      retryFetchOpts.signal = composeUpstreamSignal(requestSignal, forwardTimeoutMs);
       upstreamResp = await fetch(target.retryTarget.url, retryFetchOpts);
       if (upstreamResp.ok) {
         pipe.info("RETRY_SUCCESS", `Retry returned ${upstreamResp.status}`);
@@ -397,6 +400,7 @@ async function forwardWithRetry(
       }
       return { resp: upstreamResp, retried: true };
     } catch (retryErr: unknown) {
+      if (requestSignal.aborted) throw retryErr;
       if (isRateLimitExceededError(retryErr)) throw retryErr;
       if (retryErr instanceof DOMException && retryErr.name === "TimeoutError") {
         pipe.error("RETRY_FORWARD", `Timeout after ${forwardTimeoutMs / 1000}s`);
@@ -1036,12 +1040,14 @@ export async function handleChatCompletions(
       target, upstreamHeaders, upstreamBody,
       body, originalHeaders,
       pipe, forwardTimeoutMs,
+      c.req.raw.signal,
       sessionKey,
       { config, instanceId: spaceId || undefined },
     );
     upstreamResp = result.resp;
     retried = result.retried;
   } catch (err: unknown) {
+    if (c.req.raw.signal.aborted) return new Response(null, { status: 499 });
     if (isRateLimitExceededError(err)) {
       pipe.info("RATE_LIMIT", "TPM/QPM exceeded");
       return err.response;

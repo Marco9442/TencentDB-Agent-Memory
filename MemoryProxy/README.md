@@ -1,8 +1,8 @@
 # MemoryProxy
 
-MemoryProxy is a **transparent LLM request proxy**: instead of having a coding agent (Claude Code / CodeBuddy / ...) talk to the LLM directly, requests are routed through the proxy first. Around each forward it automatically runs session initialization, memory injection, conversation write-back and more, so an agent can tap into the team memory, Skills and Knowledge provided by [MemoryCore](../MemoryCore/README.md) **without changing a single line of code**.
+MemoryProxy is a **transparent LLM request proxy**: instead of having a coding agent (Claude Code / CodeBuddy / ...) talk to the LLM directly, requests are routed through the proxy first. Chat/Messages requests can run session initialization, memory injection and conversation write-back, while the native Responses route preserves the upstream protocol and observes usage. This lets an agent tap into the team memory, Skills and Knowledge provided by [MemoryCore](../MemoryCore/README.md) **without changing a single line of code**.
 
-It is "transparent" to both the client and the upstream model — it changes no protocol and forwards OpenAI `/v1/chat/completions` and Anthropic `/v1/messages` verbatim. It just does a few extra things on the way in and out: **session initialization, context injection, conversation write-back, authentication and usage reporting**.
+It is "transparent" to both the client and the upstream model — it keeps the OpenAI Chat Completions and Anthropic Messages wire formats intact, and has a dedicated native OpenAI Responses transport at `/v1/responses`. The existing Chat/Messages and Responses pipelines reuse **authentication, session initialization, context injection, rate limiting, usage observation and final conversation write-back**; only the wire adapters and protocol-specific forwarding differ. See [Protocol and path compatibility](#protocol-and-path-compatibility).
 
 > In one line: MemoryProxy handles "access & forwarding"; MemoryCore handles "storage & processing" of memory. The proxy itself persists no memory data — all Memory / Skill / Knowledge reads and writes go through the MemoryCore Gateway (default `:8420`). For the overall product positioning, see the repo root [README.md](../README.md).
 
@@ -13,7 +13,8 @@ Coding agent (Claude Code / CodeBuddy / ...)
         │  OpenAI / Anthropic protocol (unchanged)
         ▼
    MemoryProxy :8096        ← this project (LLM request proxy)
-        │  session init / injection / write-back / auth / reporting
+        │  Chat/Messages: session init / injection / write-back
+        │  Responses: auth / session / injection / forwarding / reporting
         ├─────────────► Upstream LLM (TokenHub / OpenAI-compatible)
         │
         └─ HTTP API ─► MemoryCore Gateway :8420
@@ -24,16 +25,17 @@ Coding agent (Claude Code / CodeBuddy / ...)
 
 ## Core capabilities
 
-- **Session initialization**: intercepts the first request and guides the user through an interactive form to pick team → agent → task, then injects the agent/task context into the system prompt. Supports auto pre-selection from request headers (`x-team-id` / `x-agent-id` / `x-task-id`).
-- **Context injection**: injects Skills, Knowledge and Memory L2/L3 into the system prompt on demand; L0/L1 are exposed as read-only tools for the model to query proactively, avoiding upstream KV-cache invalidation.
-- **Conversation write-back (extraction)**: at the end of each human turn, sends the conversation slice to MemoryCore `/v3/skill/conversation/add` (Skill archival) and writes L0 short-term memory for background extraction on the core side.
+- **Session initialization**: on the Chat/Messages pipeline, intercepts the first request and guides the user through an interactive form to pick team → agent → task, then injects the agent/task context into the system prompt. Supports auto pre-selection from request headers (`x-team-id` / `x-agent-id` / `x-task-id`).
+- **Context injection**: on the Chat/Messages pipeline, injects Skills, Knowledge and Memory L2/L3 into the system prompt on demand; L0/L1 are exposed as read-only tools for the model to query proactively, avoiding upstream KV-cache invalidation.
+- **Conversation write-back (extraction)**: on the Chat/Messages pipeline, at the end of each human turn, sends the conversation slice to MemoryCore `/v3/skill/conversation/add` (Skill archival) and writes L0 short-term memory for background extraction on the core side.
 - **Auth & identity**: calls MemoryCore `POST /v3/meta/auth/verify` to validate `x-tdai-user-key` and resolve `user_id` as the end-to-end user identity; `spaceId` (memory instance id) is auto-extracted from the `/proxy/<spaceId>/...` path.
+- **Native Responses transport**: supports `/v1/responses` and agent/space or legacy `/proxy/<spaceId>` variants, preserves the original JSON request (`input`, `instructions` and unknown fields included), and transparently passes through JSON or SSE responses while observing usage as a side channel.
 - **System-user passthrough**: internal service accounts (e.g. memory / wiki internal calls) short-circuit session init and injection on match, doing pure passthrough + billing only.
 - **Skill Bridge / Memory Bridge**: reverse-proxies MemoryCore's skill / memory HTTP tools, injecting `serviceToken` on forward so credentials never appear in an LLM-visible prompt.
 - **Unified storage abstraction (ProxyStorage)**: session init state, injection cache and Skill state (`inj:*` / `sk:*` / `vpin:*`) support five backends — Redis, COS (kernel-sts), SQLite, FS, Memory. COS is preferred for multi-node deployments.
 - **Input TPM / QPM rate limiting**: 60-second sliding-window limiting on Redis, keyed by `spaceId × final model`, adjustable at runtime via `/v3/admin/rate-limits`.
 - **Observability & usage reporting**: three independent channels — Opik trace, Langfuse (one trace = one turn), ClickHouse (per-turn token detail). Any one failing does not affect the business path.
-- **Credit billing report**: after each upstream response completes, computes CreditDelta from the pricing table and reports it to the billing service; only requests whose path carries `/proxy/<spaceId>/` are counted.
+- **Credit billing report**: after each upstream response completes, computes CreditDelta from the pricing table and reports it to the billing service; only recognized space-bearing paths are counted.
 - **Multi-node deployment**: scales horizontally with an external gateway plus the COS backend; the `/skill-bridge` and `/memory-bridge` prefixes are passed through verbatim from the gateway to proxy instances.
 
 ## Request pipeline
@@ -163,7 +165,7 @@ Always uses `./config.yaml`, auto-detects the `node` path (nvm / fnm compatible)
 
 ## Client configuration
 
-Point the coding agent's upstream address at this proxy and keep the rest (`apiKey`, `model`, ...) unchanged. Include `spaceId` (memory instance id) in the path — the proxy auto-extracts it for auth, injection and billing.
+Point the coding agent's upstream address at this proxy and keep the rest (`apiKey`, `model`, ...) unchanged. Include `spaceId` (memory instance id) in the path — the proxy extracts it for auth and reporting; the existing Chat/Messages pipeline also uses it for session and injection state.
 
 OpenAI-compatible client:
 
@@ -183,12 +185,166 @@ Anthropic Messages client:
 }
 ```
 
+### Protocol and path compatibility
+
+MemoryProxy has a dedicated native Responses transport. The main paths are:
+
+- OpenAI Chat Completions: `POST /<agentSource>/<spaceId>/v1/chat/completions`
+- Anthropic Messages: `POST /<agentSource>/<spaceId>/v1/messages`
+- OpenAI Responses: `POST /v1/responses`
+- Agent/space Responses: `POST /<agentSource>/<spaceId>/v1/responses` (for example `/codebuddy/<spaceId>/v1/responses` or `/codex/<spaceId>/v1/responses`)
+- Legacy Responses: `POST /proxy/<spaceId>/v1/responses`
+
+The same explicit Responses route family also includes `/v1/responses/compact`,
+`/v1/models` and `/v1/alpha/search` (with the corresponding agent/space and
+legacy prefixes). The `models` helper is `GET`; the other listed helper paths
+are `POST`.
+
+Use `codebuddy` as the `agentSource` for a direct Responses client when auth and
+credit reporting are enabled; the current path extractor recognizes it as a
+space-bearing agent. Use `claude-code` for Claude Code's Anthropic client. The
+legacy `/proxy/<spaceId>/...` prefix remains available.
+
+For `POST /.../responses`, the handler preserves the Responses JSON shape and
+forwards `input`, top-level `instructions`, `previous_response_id`, unknown
+fields and model aliases without converting to Chat. If session or memory
+injection is enabled, only the server-owned `instructions` overlay is added;
+the original input/tool-call sequence remains intact. A non-stream response
+keeps the upstream status/body and relevant headers. An SSE response is byte
+transparent; the parser observes usage, status, refusal and function-call
+arguments without changing the stream. Transport-only and credential headers
+are removed at the proxy boundary.
+
+The native Responses handler is separate from the Chat/Messages wire adapter
+but reuses the shared session and memory services. With
+`sessionInit.enabled=true`, it validates the authenticated user's visible
+Team/Agent/Task headers, registers or recovers a Codex session, maps
+`previous_response_id` back to that session, and returns structured `409` when
+the non-interactive binding is missing. Configured injection blocks are merged
+into `instructions`; completed final responses can write one deduplicated L0
+turn and trigger Skill extraction. Client credentials and internal identity
+headers are used by MemoryProxy only and are not forwarded to the provider.
+
+### Headless clients: headers and session binding
+
+For the existing Chat/Messages session pipeline, a non-interactive client should
+send these headers on the first request and every tool-loop follow-up:
+
+```http
+Authorization: Bearer <business-user-key>
+x-team-id: <team_id>
+x-agent-id: <agent_id>
+x-task-id: <task_id>
+x-conversation-id: <stable-conversation-id>
+```
+
+The `team_id`, `agent_id` and `task_id` values are checked against the metadata
+visible to the authenticated user; headers are not trusted blindly. With
+`sessionInit.headerAutoSelect.enabled=true`, all three identity headers and a
+valid session header let the Chat/Messages or native Responses handler register
+the session without the interactive form. A missing or invalid binding returns
+structured `409` on native Responses and is not forwarded to the provider.
+
+The session binding is effectively:
+
+```text
+(spaceId, authenticated user_id, agentSource, sessionId)
+```
+
+`sessionId` is taken, in order, from `x-tdai-session-key`, the Codex/session
+headers, `prompt_cache_key`, `conversation.id`, and only then a scoped
+`previous_response_id` mapping. Reuse one value for one conversation and
+generate a new value for a new conversation. With Responses session-init
+enabled, missing Team/Agent/Task/session binding is rejected instead of being
+silently bypassed.
+
+### Codex
+
+Codex can use the native Responses route directly. A provider configuration can
+look like this:
+
+```toml
+# ~/.codex/config.toml — Codex → MemoryProxy → Responses-capable upstream
+model = "<memoryproxy-model>"
+model_provider = "memory-proxy"
+
+[model_providers.memory-proxy]
+name = "MemoryProxy"
+base_url = "http://127.0.0.1:8096/codebuddy/<spaceId>/v1"
+env_key = "MEMORY_PROXY_API_KEY"
+wire_api = "responses"
+requires_openai_auth = true
+http_headers = {
+  "x-team-id" = "<team_id>",
+  "x-agent-id" = "<agent_id>",
+  "x-task-id" = "<task_id>",
+  "x-conversation-id" = "<stable-conversation-id>"
+}
+```
+
+`MEMORY_PROXY_API_KEY` is the business user key accepted by MemoryProxy. Configure
+the upstream provider key separately in `upstream.agents.codebuddy.apiKey` (or
+the global `upstream.apiKey`); the client key is used for MemoryProxy auth and
+is not forwarded on the Responses upstream leg. Keep the four custom headers
+stable across tool calls. `/codex/<spaceId>/v1` is also a registered route and is
+recognized by the auth/credit space extractor; use whichever agent name matches
+the configured upstream profile.
+
+### CC Switch
+
+When CC Switch is the client/provider switch in front of MemoryProxy, select its
+native **OpenAI Responses** mode and set the provider base URL to:
+
+```text
+http://127.0.0.1:8096/codebuddy/<spaceId>/v1
+```
+
+Set the business-user API key and preserve `x-team-id`, `x-agent-id`,
+`x-task-id` and `x-conversation-id`. Do not enable a Responses-to-Chat
+conversion for this leg: MemoryProxy accepts native Responses and forwards it
+to a Responses-capable upstream. If a CC Switch deployment is used as
+MemoryProxy's upstream instead, set `upstream.agents.codebuddy.url` to its
+OpenAI-compatible `/v1` endpoint and ensure that endpoint exposes
+`/v1/responses` plus JSON/SSE.
+
+### CLIProxyAPI
+
+CLIProxyAPI can be used as the upstream of MemoryProxy through its normal
+OpenAI-compatible `/v1` endpoint. For a native Responses route, the selected
+CLIProxyAPI provider must support `/v1/responses` and JSON/SSE:
+
+```yaml
+# MemoryProxy/config.yaml
+upstream:
+  agents:
+    codebuddy:
+      url: "http://127.0.0.1:8317/v1"
+      apiKey: "<CLIProxyAPI-api-key>"
+```
+
+If CLIProxyAPI is instead the client-facing sidecar, configure its custom
+provider base URL as
+`http://127.0.0.1:8096/codebuddy/<spaceId>/v1`, select its OpenAI Responses
+wire format, and preserve the four Team/Agent/Task/session headers. No
+Responses-to-Chat converter is required for this native route.
+
+## Known limitations
+
+- Native Responses reuses session, injection, rate-limit, usage and final L0/Skill hooks, but the cost-guard routing extension and Opik/Langfuse generation spans are not yet protocol-specific; upstream selection is based on the configured agent/global URL.
+- The Responses upstream must implement the requested Responses endpoint. MemoryProxy does not convert Responses to Chat Completions or Anthropic Messages.
+- With auth enabled, root `/v1/responses` has no `spaceId` for `auth/verify`; use `/codebuddy/<spaceId>/v1/responses`, `/codex/<spaceId>/v1/responses` or `/proxy/<spaceId>/v1/responses`.
+- `input`, `instructions`, `previous_response_id`, unknown JSON fields and model aliases are preserved semantically. When server-side session/memory injection is enabled, `instructions` is intentionally overlaid and the request is reserialized.
+- Team/Agent/Task and session headers are consumed by MemoryProxy for Responses session validation and are not forwarded as provider credentials. For Chat/Messages, missing or unstable session headers can skip session initialization and injection; direct header registration also requires a valid task id even though the interactive form can make task optional.
+- Usage logging and credit reporting are best effort. An unknown model alias may be forwarded successfully but still produce no priced credit record; credit extraction also depends on a recognized space-bearing path.
+
 ## Main HTTP endpoints
 
 | Method | Path | Description |
 | --- | --- | --- |
 | `POST` | `/proxy/<spaceId>/v1/chat/completions` | OpenAI-compatible main-model call (with memory instance id) |
 | `POST` | `/proxy/<spaceId>/v1/messages` | Anthropic Messages main-model call |
+| `POST` | `/proxy/<spaceId>/v1/responses` | Native OpenAI Responses passthrough (JSON/SSE) |
+| `POST` | `/<agent>/<spaceId>/v1/responses` | Native Responses passthrough; `codebuddy` is recommended with auth enabled |
 | `POST` | `/v1/messages` | Anthropic Messages API (fallback without spaceId) |
 | `POST` | `/*` | OpenAI-compatible chat endpoint (catch-all) |
 | `ALL`  | `/skill-bridge/**` | reverse-proxy for MemoryCore skill HTTP tools |

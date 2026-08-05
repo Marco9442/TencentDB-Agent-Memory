@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, feature/openai-responses]
 
 # Cancel previous runs for the same PR / branch
 concurrency:
@@ -156,4 +156,37 @@ jobs:
         run: |
           git fetch origin "${{ github.base_ref || 'main' }}" --depth=50 || true
           bash scripts/ci/check-skill-queue-isolation.sh
+
+  # ── 8. MemoryProxy validation ────────────────────────────────────────────
+  # One Node 22 path is sufficient: package.json exposes npm scripts, and the
+  # pnpm lockfile is intentionally not part of this CI validation path.
+  memory-proxy:
+    name: MemoryProxy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: MemoryProxy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: MemoryProxy/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      # package.json has no typecheck script; keep this as a direct compiler check.
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test -- --passWithNoTests
+
+      - name: Docker build
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker build --tag memory-proxy:ci .
 

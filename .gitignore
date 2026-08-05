@@ -20,6 +20,7 @@ __pycache__/
 scripts/export-tencent-vdb/dist/
 scripts/migrate-sqlite-to-tcvdb/dist/
 scripts/read-local-memory/dist/
+MemoryCore/scripts/seed-v2/dist/
 
 # Root-level build output (not used at runtime, not published)
 dist/

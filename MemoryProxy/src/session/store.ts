@@ -80,6 +80,11 @@ export class SessionStore {
     this.bindingRepo = repo;
   }
 
+  /** Read-only access for protocol adapters that must validate headers before recovery. */
+  getBindingRepo(): BindingRepo | undefined {
+    return this.bindingRepo;
+  }
+
   /**
    * Associate a keyId with a full (userId, agentSource, sessionId) identity so
    * that later {@link set} / {@link delete} / {@link getOrRecover} calls can
@@ -248,6 +253,18 @@ export class SessionStore {
     identity: SessionIdentity,
     ctx: RecoveryContext,
   ): Promise<SessionInitState | undefined> {
+    const previousIdentity = this.identities.get(keyId);
+    if (
+      previousIdentity &&
+      (previousIdentity.userId !== identity.userId
+        || previousIdentity.agentSource !== identity.agentSource
+        || (previousIdentity.spaceId ?? "") !== (identity.spaceId ?? ""))
+    ) {
+      // ponytail: keep the existing L1 key shape; invalidate on identity
+      // mismatch instead of broadening every legacy caller's key contract.
+      this.states.delete(keyId);
+      this.identities.delete(keyId);
+    }
     // Bind identity for downstream set()/delete()/probeL2a callchain.
     this.identities.set(keyId, identity);
 
