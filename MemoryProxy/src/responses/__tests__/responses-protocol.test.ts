@@ -68,6 +68,14 @@ describe("Responses route contract", () => {
   });
 
   it.each([
+    ["/v1/responses/compact", "responses/compact"],
+    ["/v1/models", "models"],
+    ["/v1/alpha/search", "alpha/search"],
+  ])("classifies root helper %s as %s", (path, endpoint) => {
+    expect(matchResponsesRoute(path)).toMatchObject({ endpoint, prefix: "root" });
+  });
+
+  it.each([
     "/v1/responses",
     "/openai/demo-space/v1/responses",
     "/proxy/demo-space/responses",
@@ -128,6 +136,20 @@ describe("Responses request forwarding", () => {
 
     expect(response.status).toBe(200);
     expect(JSON.parse(forwardedBody(init))).toStrictEqual(requestBody);
+  });
+
+  it("forwards raw JSON bytes when no server-owned overlay is needed", async () => {
+    const rawBody = '{ "model": "m", "input": "raw", "future": [1, 2] }';
+    const upstream = stubJsonUpstream({ id: "resp_raw", status: "incomplete", output: [] });
+
+    const response = await createApp(testConfig()).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: rawBody,
+    });
+
+    expect(response.status).toBe(200);
+    expect(forwardedBody(upstream.mock.calls[0]?.[1] as RequestInit)).toBe(rawBody);
   });
 
   it.each([
@@ -353,6 +375,23 @@ describe("Responses SSE protocol", () => {
 
     expect(parsed.functionCalls).toMatchObject([{ id: "fc_1", arguments: "{\"q\":\"x\"}" }]);
     expect(parsed.refusalText).toBe("");
+  });
+
+  it("merges canonical item_id argument deltas into the output item call", () => {
+    const parsed = parseResponsesSse([
+      "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\n",
+      "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"delta\":\"{\\\"q\\\":\\\"x\\\"}\"}\n\n",
+      "event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}\n\n",
+      "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_canonical_fc\",\"status\":\"completed\"}}\n\n",
+    ]);
+
+    expect(parsed.malformedEvents).toBe(0);
+    expect(parsed.functionCalls).toStrictEqual([{
+      id: "item_1",
+      call_id: "call_1",
+      name: "lookup",
+      arguments: "{\"q\":\"x\"}",
+    }]);
   });
 
   it("does not turn failed or error events into a completed round", () => {

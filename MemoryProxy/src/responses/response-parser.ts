@@ -30,8 +30,10 @@ function responseFromEvent(json: JsonObject | null): JsonObject | null {
 function mergeCalls(existing: ResponsesFunctionCall[], next: ResponsesFunctionCall[]): ResponsesFunctionCall[] {
   const result = [...existing];
   for (const call of next) {
-    const key = call.call_id ?? call.id;
-    const index = key ? result.findIndex((item) => (item.call_id ?? item.id) === key) : -1;
+    const keys = [call.call_id, call.id].filter((value): value is string => !!value);
+    const index = keys.length > 0
+      ? result.findIndex((item) => keys.some((key) => item.call_id === key || item.id === key))
+      : -1;
     if (index < 0) result.push(call);
     else result[index] = { ...result[index], ...call };
   }
@@ -153,9 +155,9 @@ export class ResponsesSseResponseParser {
     if (type === "response.function_call_arguments.delta" || type === "response.function_call_arguments.done") {
       const itemId = typeof json.item_id === "string" ? json.item_id : undefined;
       const callId = typeof json.call_id === "string" ? json.call_id : undefined;
-      const key = callId ?? itemId;
-      const currentIndex = key
-        ? this.functionCalls.findIndex((call) => (call.call_id ?? call.id) === key)
+      const keys = [callId, itemId].filter((value): value is string => !!value);
+      const currentIndex = keys.length > 0
+        ? this.functionCalls.findIndex((call) => keys.some((key) => call.call_id === key || call.id === key))
         : -1;
       const current = currentIndex >= 0 ? this.functionCalls[currentIndex] : undefined;
       const delta = typeof json.delta === "string" ? json.delta : undefined;

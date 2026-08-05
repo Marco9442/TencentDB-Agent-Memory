@@ -1,0 +1,73 @@
+services:
+  mock-responses:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  memory-core:
+    build:
+      context: ../../MemoryCore
+      dockerfile: Dockerfile
+    environment:
+      TDAI_GATEWAY_CONFIG: /data/config/tdai-gateway.yaml
+      TDAI_GATEWAY_HOST: 0.0.0.0
+      TDAI_DATA_DIR: /data/tdai-memory
+      TDAI_LLM_API_KEY: e2e-only-key
+      TDAI_LLM_BASE_URL: http://mock-responses:8080/v1
+      TDAI_LLM_MODEL: e2e-model
+    volumes:
+      - core-data:/data/tdai-memory
+      - ./core-config.yaml:/data/config/tdai-gateway.yaml:ro
+    depends_on:
+      mock-responses:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8420/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  memory-proxy:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    volumes:
+      - proxy-data:/data/tdai-memory-proxy
+      - ./proxy-config.yaml:/data/config.yaml:ro
+    depends_on:
+      mock-responses:
+        condition: service_healthy
+      memory-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8096/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    environment:
+      PROXY_URL: http://memory-proxy:8096
+      CORE_URL: http://memory-core:8420
+      MOCK_URL: http://mock-responses:8080
+    depends_on:
+      mock-responses:
+        condition: service_healthy
+      memory-core:
+        condition: service_healthy
+      memory-proxy:
+        condition: service_healthy
+
+volumes:
+  core-data:
+  proxy-data:

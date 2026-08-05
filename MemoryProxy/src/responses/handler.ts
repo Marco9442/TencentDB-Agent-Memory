@@ -333,6 +333,7 @@ function requestPath(c: Context): string {
 
 interface PreparedResponsesRequest {
   body: Record<string, unknown>;
+  bodyChanged: boolean;
   messages: JsonObject[];
   sessionKey?: string;
   sessionInfo?: Record<string, unknown> | null;
@@ -381,17 +382,25 @@ async function prepareResponsesRequest(
   const body = request.request ? { ...request.request } as Record<string, unknown> : null;
   const agentSource = route.agentName === "openai" ? "openai" : "codex";
   if (route.endpoint !== "responses" || !body) {
-    return { body: body ?? {}, messages: [], agentSource };
+    return { body: body ?? {}, bodyChanged: false, messages: [], agentSource };
   }
+
+  let bodyChanged = false;
+  const applyBody = (next: Record<string, unknown>): void => {
+    const before = JSON.stringify(body);
+    Object.assign(body, next);
+    bodyChanged ||= before !== JSON.stringify(body);
+  };
 
   const messages = responsesInputToMessages(body.input, body.instructions);
   const userId = keyId || "anonymous";
   const responseMap = responseSessionMap(config, userId, spaceId, agentSource);
+  const sessionInitializationEnabled = config.sessionInit.enabled || Boolean(config.sessionInit.debugForceIdentity);
   const resolved = await resolveCodexSessionKey({
     headers: c.req.raw.headers,
     body,
     previousResponseId: request.previousResponseId,
-    fallbackKey: config.sessionInit.enabled ? undefined : keyId,
+    fallbackKey: sessionInitializationEnabled ? undefined : keyId,
     responseSessionMap: responseMap,
   });
   if (!resolved.sessionKey) return buildSessionNotInitializedResponse();
@@ -410,7 +419,19 @@ async function prepareResponsesRequest(
     : null;
 
   let sessionInfo: Record<string, unknown> | null | undefined;
-  if (config.sessionInit.enabled) {
+  if (sessionInitializationEnabled) {
+    const forced = config.sessionInit.debugForceIdentity;
+    if (forced) {
+      // Explicit developer/e2e bypass: Responses clients cannot answer the
+      // interactive form, but still need a real TDAI identity for L0 writes.
+      sessionInfo = {
+        session_id: sessionKey,
+        user_id: userId,
+        team_id: forced.team_id,
+        agent_id: forced.agent_id,
+        ...(forced.task_id ? { task_id: forced.task_id } : {}),
+      };
+    } else {
     const store = getSessionStore();
     const identity = buildCodexSessionIdentity(sessionKey, userId, spaceId, agentSource);
     const compositeKey = `${agentSource}:${sessionKey}`;
@@ -469,7 +490,7 @@ async function prepareResponsesRequest(
         config.sessionInit,
         sessionKey,
       );
-      Object.assign(body, sessionInjection.body);
+      applyBody(sessionInjection.body);
     } else {
       const preset = parsePresetIdentity(config.sessionInit, lowerHeaders(c));
       if (!preset) return buildSessionNotInitializedResponse();
@@ -507,7 +528,8 @@ async function prepareResponsesRequest(
         config.sessionInit,
         sessionKey,
       );
-      Object.assign(body, sessionInjection.body);
+      applyBody(sessionInjection.body);
+    }
     }
   }
 
@@ -537,7 +559,7 @@ async function prepareResponsesRequest(
         : pipelineMessages;
       const additions = injectionAdditions(pipelineMessages, injectedMessages);
       if (additions.length > 0) {
-        Object.assign(body, injectCodexInstructions(body, additions.join("\n\n")).body);
+        applyBody(injectCodexInstructions(body, additions.join("\n\n")).body);
       }
     } catch {
       // Existing proxy semantics treat injection as non-fatal; the original
@@ -547,6 +569,7 @@ async function prepareResponsesRequest(
 
   return {
     body,
+    bodyChanged,
     messages,
     sessionKey,
     sessionInfo,
@@ -586,6 +609,12 @@ function publishResponsesCompletion(args: {
   predecessorState?: ResponsesRoundState | null;
 }): PublishedResponsesLifecycle {
   const publicationTasks: Promise<unknown>[] = [];
+  // HTTP errors are transport failures even when an upstream happens to put a
+  // completed-looking Responses object in the error body. Do not publish
+  // response/session/round state or trigger memory side effects from them.
+  if (!statusIsSuccess(args.status)) {
+    return { assistantText: "", finalCandidate: false, publicationTasks };
+  }
   const id = responseId(args.parsed);
   const status = args.parsed.status;
   const streamDone = "done" in args.parsed ? args.parsed.done : true;
@@ -603,8 +632,13 @@ function publishResponsesCompletion(args: {
 
   let state: ResponsesRoundState | undefined;
   if (id && args.sessionKey && args.roundStore) {
-    const predecessor = args.predecessorState;
     const currentUser = firstRealUserMessage(args.messages);
+    // A previous response with no pending tool calls is a completed human
+    // round. A new user message after it starts a fresh round; only tool
+    // continuations inherit the predecessor's original question/history.
+    const predecessor = args.predecessorState?.pendingCallIds.length || !currentUser
+      ? args.predecessorState
+      : null;
     const outputIds = toolOutputIds(args.messages);
     const pendingCallIds = [...new Set([
       ...(predecessor?.pendingCallIds ?? []).filter((callId) => !outputIds.has(callId)),
@@ -830,6 +864,7 @@ export async function handleResponses(
   }
 
   const outgoingBody = route.endpoint === "responses" && method === "POST" && request.request
+    && lifecycle.bodyChanged
     ? JSON.stringify(lifecycle.body)
     : rawBody;
 
@@ -855,7 +890,13 @@ export async function handleResponses(
   const isStream = contentType.toLowerCase().includes("event-stream");
 
   if (!isStream || !upstream.body) {
-    const body = await upstream.arrayBuffer();
+    let body: ArrayBuffer;
+    try {
+      body = await upstream.arrayBuffer();
+    } catch {
+      if (c.req.raw.signal.aborted) return new Response(null, { status: 499 });
+      return c.json({ error: "Upstream response failed" }, 502);
+    }
     const parsed = parseResponsesJsonResponse(new TextDecoder().decode(body));
     await finalizeResponsesLifecycle({
       config,
