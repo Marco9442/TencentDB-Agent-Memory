@@ -34,6 +34,7 @@ import { trackWrite, withL0Retry } from "../tdai/pending-writes.js";
 import { isExtractionAllowed } from "../extraction-gate.js";
 import { triggerSkillExtractIfReady } from "../skill/handler-glue.js";
 import { log } from "../report/log.js";
+import { composeUpstreamSignal } from "../common/upstream-signal.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -194,10 +195,47 @@ function injectionAdditions(original: JsonObject[], injected: JsonObject[]): str
   const additions: string[] = [];
   for (const text of textFromChatMessages(injected, "system").concat(textFromChatMessages(injected, "developer"))) {
     const index = remaining.indexOf(text);
-    if (index >= 0) remaining.splice(index, 1);
-    else additions.push(text);
+    if (index >= 0) {
+      remaining.splice(index, 1);
+      continue;
+    }
+
+    const baseIndex = remaining.findIndex((base) => base && (
+      text.startsWith(`${base}\n`) ||
+      text.endsWith(`\n${base}`) ||
+      text.includes(`\n${base}\n`)
+    ));
+    if (baseIndex < 0) {
+      additions.push(text);
+      continue;
+    }
+
+    const base = remaining[baseIndex];
+    remaining.splice(baseIndex, 1);
+    const marker = `\n${base}\n`;
+    const middle = text.indexOf(marker);
+    if (middle >= 0) {
+      const prefix = text.slice(0, middle).replace(/^\n+|\n+$/g, "");
+      const suffix = text.slice(middle + marker.length).replace(/^\n+|\n+$/g, "");
+      if (prefix) additions.push(prefix);
+      if (suffix) additions.push(suffix);
+      continue;
+    }
+
+    const prefix = text.startsWith(`${base}\n`)
+      ? ""
+      : text.replace(new RegExp(`\\n+${escapeRegExp(base)}$`), "");
+    const suffix = text.startsWith(`${base}\n`)
+      ? text.slice(base.length).replace(/^\n+/, "")
+      : "";
+    if (prefix) additions.push(prefix);
+    if (suffix) additions.push(suffix);
   }
   return additions;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function createTdaiClient(config: ProxyConfig, spaceId: string): TdaiClient | null {
@@ -476,7 +514,11 @@ async function prepareResponsesRequest(
   if (config.injection.enabled && config.injection.injectors.length > 0 && sessionKey) {
     try {
       const traceId = crypto.randomUUID();
-      const pipelineBody = await getInjectionPipeline(config).process({ messages }, {
+      const pipelineBaseMessages = responsesInputToMessages(body.input, body.instructions);
+      const pipelineMessages = pipelineBaseMessages.some((message) => message.role === "system")
+        ? pipelineBaseMessages
+        : [{ role: "system", content: "" } as JsonObject, ...pipelineBaseMessages];
+      const pipelineBody = await getInjectionPipeline(config).process({ messages: pipelineMessages }, {
         protocol: "openai",
         traceId,
         keyId,
@@ -492,8 +534,8 @@ async function prepareResponsesRequest(
       });
       const injectedMessages = Array.isArray(pipelineBody.messages)
         ? pipelineBody.messages as JsonObject[]
-        : messages;
-      const additions = injectionAdditions(messages, injectedMessages);
+        : pipelineMessages;
+      const additions = injectionAdditions(pipelineMessages, injectedMessages);
       if (additions.length > 0) {
         Object.assign(body, injectCodexInstructions(body, additions.join("\n\n")).body);
       }
@@ -801,9 +843,10 @@ export async function handleResponses(
         : {}),
     };
     const timeoutMs = config.server.forwardTimeoutMs ?? 600_000;
-    if (timeoutMs > 0) init.signal = AbortSignal.timeout(timeoutMs);
+    init.signal = composeUpstreamSignal(c.req.raw.signal, timeoutMs);
     upstream = await fetch(target.url, init);
   } catch {
+    if (c.req.raw.signal.aborted) return new Response(null, { status: 499 });
     return c.json({ error: "Upstream request failed" }, 502);
   }
 

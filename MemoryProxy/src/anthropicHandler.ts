@@ -54,6 +54,7 @@ import {
   isRateLimitExceededError,
   recordInputTokenUsage,
 } from "./rate-limit/guard.js";
+import { composeUpstreamSignal } from "./common/upstream-signal.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -376,6 +377,7 @@ async function forwardWithRetry(
   originalHeaders: Record<string, string>,
   pipe: ReturnType<typeof createPipeline>,
   forwardTimeoutMs: number,
+  requestSignal: AbortSignal,
   sessionKeyForDebug?: string,
   rateLimitContext?: { config: ProxyConfig; instanceId?: string },
 ): Promise<{ resp: Response; retried: boolean }> {
@@ -447,9 +449,10 @@ async function forwardWithRetry(
       method: "POST",
       headers: upstreamHeaders,
       body: JSON.stringify(upstreamBody),
-      signal: AbortSignal.timeout(forwardTimeoutMs),
+      signal: composeUpstreamSignal(requestSignal, forwardTimeoutMs),
     });
   } catch (err: unknown) {
+    if (requestSignal.aborted) throw err;
     if (err instanceof DOMException && err.name === "TimeoutError") {
       pipe.error("FORWARD", `Timeout after ${forwardTimeoutMs / 1000}s`);
     } else {
@@ -460,6 +463,10 @@ async function forwardWithRetry(
 
   if (upstreamResp) {
     pipe.forwardDone(upstreamResp.status);
+  }
+
+  if (requestSignal.aborted) {
+    throw requestSignal.reason ?? new DOMException("The operation was aborted.", "AbortError");
   }
 
   const shouldRetry = target.retryTarget &&
@@ -488,7 +495,7 @@ async function forwardWithRetry(
         method: "POST",
         headers: retryHeaders,
         body: JSON.stringify(originalBody),
-        signal: AbortSignal.timeout(forwardTimeoutMs),
+        signal: composeUpstreamSignal(requestSignal, forwardTimeoutMs),
       });
       if (upstreamResp.ok) {
         pipe.info("RETRY_SUCCESS", `Retry returned ${upstreamResp.status}`);
@@ -497,6 +504,7 @@ async function forwardWithRetry(
       }
       return { resp: upstreamResp, retried: true };
     } catch (retryErr: unknown) {
+      if (requestSignal.aborted) throw retryErr;
       if (isRateLimitExceededError(retryErr)) throw retryErr;
       if (retryErr instanceof DOMException && retryErr.name === "TimeoutError") {
         pipe.error("RETRY_FORWARD", `Timeout after ${forwardTimeoutMs / 1000}s`);
@@ -1179,12 +1187,14 @@ export async function handleAnthropicMessages(
       target, upstreamHeaders, upstreamBody,
       retryBody, originalHeaders,
       pipe, forwardTimeoutMs,
+      c.req.raw.signal,
       sessionKey,
       { config, instanceId: spaceId || undefined },
     );
     upstreamResp = result.resp;
     retried = result.retried;
   } catch (err: unknown) {
+    if (c.req.raw.signal.aborted) return new Response(null, { status: 499 });
     if (isRateLimitExceededError(err)) {
       pipe.info("RATE_LIMIT", "TPM/QPM exceeded");
       return err.response;

@@ -12,6 +12,7 @@ import { parseResponsesSse } from "../response-parser.js";
 import { matchResponsesRoute } from "../route.js";
 import { findLastFinalAssistant, isFinalAnswer } from "../../skill/normalize-conversation.js";
 import { countHumanTurns } from "../../turnSeq.js";
+import { __resetInjectionPipelineForTests } from "../../injection/index.js";
 import type { ProxyConfig } from "../../types.js";
 
 function testConfig(): ProxyConfig {
@@ -47,6 +48,7 @@ function forwardedBody(init: RequestInit | undefined): string {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  __resetInjectionPipelineForTests();
 });
 
 describe("Responses route contract", () => {
@@ -126,6 +128,119 @@ describe("Responses request forwarding", () => {
 
     expect(response.status).toBe(200);
     expect(JSON.parse(forwardedBody(init))).toStrictEqual(requestBody);
+  });
+
+  it.each([
+    {
+      name: "without instructions",
+      body: {
+        model: "model-alias",
+        input: "real user input",
+        tools: [{ type: "function", function: { name: "lookup" } }],
+        previous_response_id: "resp_prev",
+        unknown_provider_field: { nested: true },
+      },
+      assertInstructions: (instructions: unknown) => {
+        expect(typeof instructions).toBe("string");
+        expect(instructions).toEqual(expect.stringContaining("<skill_tools>"));
+      },
+    },
+    {
+      name: "with string instructions",
+      body: {
+        model: "model-alias",
+        input: "real user input",
+        instructions: "client instructions",
+        unknown_provider_field: { nested: true },
+      },
+      assertInstructions: (instructions: unknown) => {
+        expect(instructions).toEqual(expect.stringContaining("client instructions"));
+        expect(String(instructions).match(/client instructions/g)).toHaveLength(1);
+        expect(String(instructions).match(/<skill_tools>/g)).toHaveLength(1);
+      },
+    },
+    {
+      name: "with array instructions",
+      body: {
+        model: "model-alias",
+        input: "real user input",
+        instructions: [
+          { type: "input_text", text: "client instructions" },
+          { type: "future_item", payload: { keep: true } },
+        ],
+        unknown_provider_field: { nested: true },
+      },
+      assertInstructions: (instructions: unknown) => {
+        expect(instructions).toBeInstanceOf(Array);
+        const items = instructions as Array<Record<string, unknown>>;
+        expect(items[0]?.type).toBe("input_text");
+        expect(items[0]?.text).toEqual(expect.stringContaining("client instructions"));
+        expect(String(items[0]?.text).match(/<skill_tools>/g)).toHaveLength(1);
+        expect(items[1]).toStrictEqual({ type: "future_item", payload: { keep: true } });
+      },
+    },
+  ])("overlays enabled injection into $name without changing the Responses shape", async ({ body, assertInstructions }) => {
+    const config = testConfig();
+    config.injection.enabled = true;
+    config.injection.injectors = ["skill"];
+    config.injection.externalGatewayUrl = "http://proxy.test";
+    const upstream = stubJsonUpstream({ id: "resp_injection", status: "incomplete", output: [] });
+
+    const response = await createApp(config).request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(200);
+
+    const forwarded = JSON.parse(forwardedBody(upstream.mock.calls[0]?.[1] as RequestInit)) as Record<string, unknown>;
+    expect(forwarded.input).toStrictEqual(body.input);
+    expect(forwarded.model).toBe(body.model);
+    expect(forwarded.tools).toStrictEqual(body.tools);
+    expect(forwarded.previous_response_id).toBe(body.previous_response_id);
+    expect(forwarded.unknown_provider_field).toStrictEqual(body.unknown_provider_field);
+    assertInstructions(forwarded.instructions);
+  });
+
+  it("propagates a cancelled Responses request to the upstream stream without finalizing", async () => {
+    const config = testConfig();
+    config.server.forwardTimeoutMs = 10_000;
+    let upstreamSignal: AbortSignal | undefined;
+    const upstream = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      upstreamSignal = init?.signal ?? undefined;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'event: response.output_text.delta\ndata: {"delta":"partial"}\n\n',
+          ));
+          upstreamSignal?.addEventListener("abort", () => {
+            controller.error(upstreamSignal?.reason ?? new DOMException("aborted", "AbortError"));
+          }, { once: true });
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    vi.stubGlobal("fetch", upstream);
+
+    const controller = new AbortController();
+    const response = await createApp(config).fetch(new Request("http://proxy/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "model-alias", input: "cancel me", stream: true }),
+      signal: controller.signal,
+    }));
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    await reader!.read();
+
+    controller.abort();
+
+    await expect(reader!.read()).rejects.toThrow();
+    expect(upstreamSignal?.aborted).toBe(true);
+    expect(upstream).toHaveBeenCalledOnce();
   });
 });
 
