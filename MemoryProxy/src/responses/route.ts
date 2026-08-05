@@ -26,7 +26,11 @@ export function matchResponsesRoute(requestPath: string): ResponsesRoute | null 
   let prefix: ResponsesRoute["prefix"] = "root";
   let agentName: string | undefined;
 
-  if (parts[0] === "proxy" && parts.length >= 3) {
+  if (parts[0] === "v1") {
+    // Root `/v1/...` helpers have three or more path segments too; classify
+    // them before the agent/space branch below.
+    tail = parts;
+  } else if (parts[0] === "proxy" && parts.length >= 3) {
     tail = parts.slice(2);
     prefix = "proxy-space";
   } else if (parts.length >= 3) {

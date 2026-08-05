@@ -1,0 +1,36 @@
+deployMode: standalone
+stateBackend: local
+
+server:
+  host: 0.0.0.0
+  port: 8420
+
+data:
+  baseDir: /data/tdai-memory
+
+llm:
+  baseUrl: http://mock-responses:8080/v1
+  apiKey: e2e-only-key
+  model: e2e-model
+  maxTokens: 128
+  timeoutMs: 5000
+
+memory:
+  capture:
+    enabled: true
+  extraction:
+    enabled: false
+  recall:
+    enabled: false
+  pipeline:
+    everyNConversations: 999999
+    enableWarmup: false
+  storeBackend: sqlite
+  embedding:
+    provider: none
+  bm25:
+    enabled: true
+
+metadata:
+  store:
+    sqliteBaseDir: /data/tdai-memory/metadata

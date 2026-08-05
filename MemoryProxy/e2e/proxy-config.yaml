@@ -1,0 +1,75 @@
+server:
+  host: 0.0.0.0
+  port: 8096
+  forwardTimeoutMs: 15000
+
+upstream:
+  url: http://mock-responses:8080/v1
+  apiKey: mock-upstream-key
+
+log:
+  backend: console
+  level: info
+  file: ""
+
+redis:
+  enabled: false
+
+storage:
+  enabled: true
+  backend: fs
+  fs:
+    fsRoot: /data/tdai-memory-proxy/storage
+
+rateLimit:
+  tpm: 1000000
+  qpm: 1000
+
+extraction:
+  enabled: true
+  extractors:
+    - tdai-memory
+
+injection:
+  enabled: true
+  injectors:
+    - tdai-memory
+  externalGatewayUrl: http://memory-proxy:8096
+
+sessionInit:
+  enabled: false
+  debugForceIdentity:
+    team_id: e2e-team
+    agent_id: e2e-agent
+    task_id: e2e-task
+
+tdai:
+  enabled: true
+  endpoint: http://memory-core:8420
+  apiKey: local
+  serviceId: e2e-space
+  memory:
+    enabled: true
+    inject: true
+    writeL0: true
+    recallL1: false
+    injectL2L3: false
+    l1Limit: 5
+    l2Limit: 3
+    timeoutMs: 3000
+
+coreSkill:
+  endpoint: ""
+  serviceToken: ""
+
+auth:
+  enabled: false
+
+clickhouse:
+  enabled: false
+
+opik:
+  enabled: false
+
+langfuse:
+  enabled: false

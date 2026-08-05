@@ -83,6 +83,7 @@ async function finalize(
   parsed: ParsedResponsesJson,
   messages: Array<Record<string, unknown>>,
   predecessorState?: Awaited<ReturnType<InMemoryResponsesRoundStore["getState"]>>,
+  status = 200,
 ): Promise<void> {
   await finalizeResponsesLifecycle({
     config,
@@ -95,7 +96,7 @@ async function finalize(
     agentSource: "codex",
     spaceId: "space-a",
     upstreamUrl: "http://upstream.test/v1/responses",
-    status: 200,
+    status,
     stream: false,
     parsed,
     messages,
@@ -239,6 +240,69 @@ describe("Responses round lifecycle", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     await expect(store.getState("resp_duplicate")).resolves.toMatchObject({ l0Status: "completed" });
+  });
+
+  it("starts a new human round after a completed previous response", async () => {
+    const config = testConfig();
+    const store = new InMemoryResponsesRoundStore("new-round-scope");
+    const map = new InMemoryCodexResponseSessionMap();
+    const l0Bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      l0Bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 });
+    }));
+
+    await finalize(
+      config,
+      store,
+      map,
+      "resp_round_1",
+      parsedResponse("resp_round_1", "completed", "answer 1"),
+      [{ role: "user", content: "question 1" }],
+    );
+    const first = await store.getState("resp_round_1");
+
+    await finalize(
+      config,
+      store,
+      map,
+      "resp_round_2",
+      parsedResponse("resp_round_2", "completed", "answer 2"),
+      [{ role: "user", content: "question 2" }],
+      first,
+    );
+
+    expect(l0Bodies.at(-1)?.messages).toStrictEqual([
+      { role: "user", content: "question 2" },
+      { role: "assistant", content: "answer 2" },
+    ]);
+    await expect(store.getState("resp_round_2")).resolves.toMatchObject({
+      originalUserInput: "question 2",
+      seenResponseIds: ["resp_round_2"],
+    });
+  });
+
+  it("does not publish lifecycle state for an HTTP error with a completed-looking body", async () => {
+    const config = testConfig();
+    const store = new InMemoryResponsesRoundStore("http-error-scope");
+    const map = new InMemoryCodexResponseSessionMap();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await finalize(
+      config,
+      store,
+      map,
+      "resp_http_error",
+      parsedResponse("resp_http_error", "completed", "should not persist"),
+      [{ role: "user", content: "failed request" }],
+      undefined,
+      500,
+    );
+
+    await expect(store.getState("resp_http_error")).resolves.toBeNull();
+    await expect(map.get("resp_http_error")).resolves.toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
