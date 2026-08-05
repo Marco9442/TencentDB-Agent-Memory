@@ -30,6 +30,12 @@ extraction:
   extractors:
     - tdai-memory
 
+injection:
+  enabled: true
+  injectors:
+    - tdai-memory
+  externalGatewayUrl: http://memory-proxy:8096
+
 sessionInit:
   enabled: false
   debugForceIdentity:
@@ -44,7 +50,7 @@ tdai:
   serviceId: e2e-space
   memory:
     enabled: true
-    inject: false
+    inject: true
     writeL0: true
     recallL1: false
     injectL2L3: false

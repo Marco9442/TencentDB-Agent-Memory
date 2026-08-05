@@ -132,7 +132,12 @@ async function responseEndpoint(req, res, body, record) {
   }
 
   if (kind === "function_final" || kind === "function_sse_final") {
-    json(res, 200, responseBody(body, kind, "completed", "tool result accepted"));
+    json(res, 200, responseBody(
+      body,
+      kind,
+      "completed",
+      kind === "function_sse_final" ? "sse tool result accepted" : "tool result accepted",
+    ));
     return;
   }
 
