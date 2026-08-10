@@ -1,5 +1,5 @@
 /**
- * ClaudeCodeProfile — second AgentProfile implementation (Markdown-structured
+ * ClaudeProfile — AgentProfile for the Claude client family (Markdown-structured
  * system prompt). Validates that the same hooks work across agents with zero
  * hook-side changes: a hook declaring `{ slot: "skills", relation: "before" }`
  * lands before `<agent_skills>` on CodeBuddy and before `## Skills` here.
@@ -175,8 +175,8 @@ export function applyMarkdownAnchor(
   return result;
 }
 
-export class ClaudeCodeProfile implements AgentProfile {
-  readonly id = "claude-code";
+export class ClaudeProfile implements AgentProfile {
+  readonly id = "claude";
   readonly protocol = "anthropic" as const;
 
   detect(systemText: string): boolean {

@@ -120,7 +120,7 @@ export function createSessionForceArchiveHandler(config: ProxyConfig) {
     }
 
     const sessionKey = typeof body.session_key === "string" ? body.session_key : "";
-    const agentSource = typeof body.agent_source === "string" ? body.agent_source : "claude-code";
+    const agentSource = typeof body.agent_source === "string" ? body.agent_source : "claude";
     const reason = typeof body.reason === "string" ? body.reason : undefined;
     const spaceId = typeof body.space_id === "string" ? body.space_id : "";
 

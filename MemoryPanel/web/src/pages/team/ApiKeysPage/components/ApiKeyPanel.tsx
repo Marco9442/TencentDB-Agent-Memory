@@ -308,7 +308,7 @@ export default function ApiKeyPanel() {
               const iid = auth?.instance_id ?? '[instance-id]';
               const endpoints: Array<{ label: string; url: string }> = [
                 { label: 'CodeBuddy', url: `${base}/codebuddy/${iid}` },
-                { label: 'Claude Code', url: `${base}/claude-code/${iid}` },
+                { label: 'Claude', url: `${base}/claude/${iid}` },
                 { label: 'OpenClaw', url: `${base}/openclaw/default` },
                 { label: 'Hermes', url: `${base}/hermes/default` },
               ];

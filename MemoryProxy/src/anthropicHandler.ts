@@ -55,6 +55,7 @@ import {
   recordInputTokenUsage,
 } from "./rate-limit/guard.js";
 import { composeUpstreamSignal } from "./common/upstream-signal.js";
+import { resolveAgentSourceFromClient } from "./client-identity.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -63,6 +64,8 @@ const SKIP_REQUEST_HEADERS = new Set([
   "connection",
   // 内部身份头只给 proxy/session-init 使用，不能透传给上游模型服务。
   "x-tdai-user-key",
+  // MemoryProxy-only client family marker; it is consumed before forwarding.
+  "x-client",
 ]);
 
 const SKIP_RESPONSE_HEADERS = new Set([
@@ -559,7 +562,7 @@ export async function handleAnthropicMessages(
 
   // ── CC request classification (feature-gated, per-agent) ─────────────────
   // 通过 agentAdapter 分类请求 —— 每个客户端有自己的规则：
-  //   - claude-code: 按 cache_control marker + tools/thinking 三分
+  //   - claude: 按 cache_control marker + tools/thinking 三分
   //   - codebuddy / unknown: 恒 main（未适配，等价现状）
   //
   // 关闭 ccRequestRouting.enabled 时强制视为 main，走完全等价现状的老链路。
@@ -568,7 +571,11 @@ export async function handleAnthropicMessages(
   const _agentFromPathEarly = _pathPartsEarly[0]
     && !["v1", "proxy", "skill-bridge", "memory-bridge"].includes(_pathPartsEarly[0])
     ? _pathPartsEarly[0] : undefined;
-  const agentAdapter = resolveAgentAdapter(_agentFromPathEarly ?? "claude-code");
+  const earlyAgentSource = resolveAgentSourceFromClient(
+    c.req.raw.headers,
+    _agentFromPathEarly ?? "unknown",
+  );
+  const agentAdapter = resolveAgentAdapter(earlyAgentSource);
   const ccRoutingEnabled = config.ccRequestRouting?.enabled === true;
   const requestKind: CcRequestKind = ccRoutingEnabled ? agentAdapter.classifyRequest(body) : "main";
 
@@ -624,11 +631,14 @@ export async function handleAnthropicMessages(
   const isStream = body.stream === true;
   let hasTools = Array.isArray(body.tools) && body.tools.length > 0;
 
-  // ── Resolve agent source from URL path (e.g. /claude-code/v1/messages) ──
+  // ── Resolve agent source from URL path (e.g. /claude/v1/messages) ──
   const pathParts = c.req.path.split("/").filter(Boolean);
   const agentFromPath = pathParts[0] && !["v1", "proxy", "skill-bridge", "memory-bridge"].includes(pathParts[0])
     ? pathParts[0] : undefined;
-  const agentSource = agentFromPath ?? "claude-code";
+  const agentSource = resolveAgentSourceFromClient(
+    c.req.raw.headers,
+    agentFromPath ?? "unknown",
+  );
 
   // ── Identity inspection ──────────────────────────────────────────────────
   const reqHeaders: Record<string, string> = {};
@@ -879,7 +889,7 @@ export async function handleAnthropicMessages(
   // 配置开关 memCommand.enabled 关闭时此段完全不执行，走原有链路。
   //
   // parseMemCommand 内部通过 agentAdapter.extractUserText 按客户端规则提取用户输入：
-  //   - claude-code: 取最后一个 text block（跳过 <system-reminder> 前缀元数据）
+  //   - claude: 取最后一个 text block（跳过 <system-reminder> 前缀元数据）
   //   - codebuddy / unknown: 走保守的"拼接所有 text"逻辑
   //
   // CC 分流：FORK/SIDEQUERY 是 CC 客户端内部构造的请求，last_user 不会以 `mem:` 开头，
@@ -986,7 +996,10 @@ export async function handleAnthropicMessages(
         sessionKey,
         userKey: callerUserKey,
       });
-  const tdaiUserMessage = extractLatestUserMessage(messages);
+  const tdaiUserMessage = extractLatestUserMessage(
+    messages,
+    (content) => agentAdapter.extractUserText(content),
+  );
 
   // ── Context injection (before cost guard) ────────────────────────────────
   // CC 分流：
@@ -1297,6 +1310,7 @@ export async function handleAnthropicMessages(
       spaceId,
       upstreamRequestId,
       requestKind,
+      upstreamStatus: upstreamResp.status,
       langfuseDebug,
       debugMetadata,
     });
@@ -1309,6 +1323,7 @@ export async function handleAnthropicMessages(
   // ── Non-streaming response ───────────────────────────────────────────────
   let respText = await upstreamResp.text();
   const endTime = new Date().toISOString();
+  const upstreamSuccess = upstreamResp.ok;
 
   let usage: Record<string, unknown> | null = null;
   let outputContent: string | null = null;
@@ -1352,7 +1367,7 @@ export async function handleAnthropicMessages(
 
   const logMeta = retried ? { retrySuccess: true } : {};
 
-  if (usage) {
+  if (upstreamSuccess && usage) {
     await recordInputTokenUsage({
       config,
       instanceId: spaceId || undefined,
@@ -1446,7 +1461,7 @@ export async function handleAnthropicMessages(
 
   // Skill extract trigger — count tool_use blocks + buffer conversation.
   // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-  if (isMainDialog && isExtractionAllowed(config, "skill")) {
+  if (isMainDialog && upstreamSuccess && isExtractionAllowed(config, "skill")) {
     await triggerSkillExtractIfReady({
       config,
       sessionKey,
@@ -1469,8 +1484,8 @@ export async function handleAnthropicMessages(
   // 短期记忆。**此前仅 stream=true 会写**，non-stream 请求（如工具/测试脚本
   // 常用的 stream:false）沉默丢失。缺失该调用意味着 CC non-stream 场景
   // 完全没有 L0 记忆写入。
-  if (isMainDialog && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
-    recordTdaiTurn(tdaiClient, tdaiIdentity, tdaiUserMessage, outputContent)
+  if (isMainDialog && upstreamSuccess && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
+    recordTdaiTurn(tdaiClient, tdaiIdentity, tdaiUserMessage, outputContent, { turnSeq: lf.turnSeq })
       .catch((err: unknown) => pipe.error("TDAI_L0", err));
   } else if (isMainDialog && tdaiClient) {
     logExtractionSkipped(config, "tdai-memory", sessionKey);
@@ -1652,6 +1667,8 @@ interface AnthropicTapContext {
   upstreamRequestId?: string;
   /** CC 请求分流类别，决定 stream 完成后是否触发 skill/L0 副作用。 */
   requestKind: CcRequestKind;
+  /** HTTP status returned by the upstream provider. */
+  upstreamStatus: number;
   /** `config.langfuse.debug === true` 的求值结果，透传避免流内重复读 config。 */
   langfuseDebug: boolean;
   /** buildRequestDebugMetadata 求值结果；debug=false 时为 {}。 */
@@ -1671,9 +1688,11 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
     let outputText = "";
     let toolUseCount = 0;
     let streamCompleted = false;
+    let streamFailed = ctx.upstreamStatus < 200 || ctx.upstreamStatus >= 300;
 
     const timeoutHandle = setTimeout(() => {
       if (!streamCompleted) {
+        streamFailed = true;
         pipe.error("STREAM_TIMEOUT", "Anthropic stream reading exceeded 5 minutes");
         // completeStream 是 async；这里 fire-and-forget（timeout 里已经无法 await）
         void completeStream().catch((err) => pipe.error("STREAM_TIMEOUT_COMPLETE", err));
@@ -1781,9 +1800,12 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
 
       // CC 分流：FORK/SIDEQUERY 不是真实对话轮，跳过 L0/skill。Credit 仍上报。
       const isMainDialog = ctx.requestKind === "main";
+      const memorySideEffectsAllowed = ctx.upstreamStatus >= 200
+        && ctx.upstreamStatus < 300
+        && !streamFailed;
 
       // Tdai L0 write
-      if (isMainDialog && ctx.tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
+      if (isMainDialog && memorySideEffectsAllowed && ctx.tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
         // Streaming 不 await（会拖慢 SSE 关流），trackWrite + withL0Retry 应对两条丢包线：
         //   - trackWrite 注册 in-flight promise 到全局 set；SIGTERM 时 index.ts 会
         //     flushPendingWrites 兜底，避免 pod rolling 时 event loop 未 flush 就退出丢 L0。
@@ -1792,6 +1814,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
           withL0Retry(() => recordTdaiTurn(
             ctx.tdaiClient!, ctx.tdaiIdentity, ctx.tdaiUserMessage,
             outputText || null,
+            { turnSeq: lf.turnSeq },
           )).catch((err: unknown) => pipe.error("TDAI_L0", err))
         );
       } else if (isMainDialog && ctx.tdaiClient) {
@@ -1804,7 +1827,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
 
       // Skill extract trigger — after stream finalization.
       // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-      if (isMainDialog && isExtractionAllowed(ctx.config, "skill")) {
+      if (isMainDialog && memorySideEffectsAllowed && isExtractionAllowed(ctx.config, "skill")) {
         await triggerSkillExtractIfReady({
           config: ctx.config,
           sessionKey: ctx.sessionKeyForSkill,
@@ -1933,6 +1956,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
         }
       }
     } catch (err: unknown) {
+      streamFailed = true;
       pipe.error("STREAM", err);
     }
 

@@ -51,6 +51,8 @@ import {
   recordInputTokenUsage,
 } from "./rate-limit/guard.js";
 import { composeUpstreamSignal } from "./common/upstream-signal.js";
+import { resolveAgentSourceFromClient } from "./client-identity.js";
+import { resolveAgentAdapter } from "./agent-adapters/index.js";
 
 /**
  * Build a per-request TdaiClient. `spaceId` (extracted from the request path
@@ -201,6 +203,8 @@ const SKIP_REQUEST_HEADERS = new Set([
   "content-length",
   "transfer-encoding",
   "connection",
+  // MemoryProxy-only routing metadata; never leak it to the model provider.
+  "x-client",
 ]);
 
 const SKIP_RESPONSE_HEADERS = new Set([
@@ -521,11 +525,15 @@ export async function handleChatCompletions(
     console.log(`[session-init-debug] raw-tail msgs=${messages.length} ${summary}`);
   }
 
-  // ── Resolve agent source from URL path (e.g. /claude-code/v1/chat/completions) ──
+  // ── Resolve agent source from URL path (e.g. /claude/v1/chat/completions) ──
   const pathParts = c.req.path.split("/").filter(Boolean);
   const agentFromPath = pathParts[0] && !["v1", "proxy", "skill-bridge", "memory-bridge"].includes(pathParts[0])
     ? pathParts[0] : undefined;
-  const agentSource = agentFromPath ?? "claude-code";
+  const agentSource = resolveAgentSourceFromClient(
+    c.req.raw.headers,
+    agentFromPath ?? "unknown",
+  );
+  const agentAdapter = resolveAgentAdapter(agentSource);
 
   // ── Identity inspection ──────────────────────────────────────────────────
   const reqHeaders: Record<string, string> = {};
@@ -853,7 +861,10 @@ export async function handleChatCompletions(
         userId: userId || null,
         sessionKey,
       });
-  const tdaiUserMessage = extractLatestUserMessage(messages);
+  const tdaiUserMessage = extractLatestUserMessage(
+    messages,
+    (content) => agentAdapter.extractUserText(content),
+  );
 
   // ── Context injection (before cost guard) ──────────────────────────────
   if (!injectedSkipped && config.injection?.enabled && config.injection.injectors.length > 0) {
@@ -1146,6 +1157,7 @@ export async function handleChatCompletions(
       lf,
       spaceId,
       upstreamRequestId,
+      upstreamStatus: upstreamResp.status,
       langfuseDebug,
       debugMetadata,
     };
@@ -1158,6 +1170,7 @@ export async function handleChatCompletions(
   // ── Non-streaming response ───────────────────────────────────────────────
   const respText = await upstreamResp.text();
   const endTime = new Date().toISOString();
+  const upstreamSuccess = upstreamResp.ok;
 
   let usage: Record<string, unknown> | null = null;
   let assistantMessage: Record<string, unknown> | null = null;
@@ -1179,7 +1192,7 @@ export async function handleChatCompletions(
 
   const logMeta = retried ? { retrySuccess: true } : {};
 
-  if (usage) {
+  if (upstreamSuccess && usage) {
     await recordInputTokenUsage({
       config,
       instanceId: spaceId || undefined,
@@ -1222,7 +1235,13 @@ export async function handleChatCompletions(
     }
 
     if (tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
-      await recordTdaiTurn(tdaiClient, tdaiIdentity, tdaiUserMessage, assistantContentForTdai(assistantMessage));
+      await recordTdaiTurn(
+        tdaiClient,
+        tdaiIdentity,
+        tdaiUserMessage,
+        assistantContentForTdai(assistantMessage),
+        { turnSeq: lf.turnSeq },
+      );
     } else if (tdaiClient) {
       logExtractionSkipped(config, "tdai-memory", sessionKey);
     }
@@ -1289,7 +1308,7 @@ export async function handleChatCompletions(
 
   // Skill extract trigger — count tool calls + buffer conversation.
   // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-  if (isExtractionAllowed(config, "skill")) {
+  if (upstreamSuccess && isExtractionAllowed(config, "skill")) {
     await triggerSkillExtractIfReady({
       config,
       sessionKey,
@@ -1393,6 +1412,8 @@ interface TapContext {
   spaceId?: string;
   /** Upstream response header `x-request-id` (empty when not returned). */
   upstreamRequestId?: string;
+  /** HTTP status returned by the upstream provider. */
+  upstreamStatus: number;
   /** `config.langfuse.debug === true` 的求值结果。 */
   langfuseDebug: boolean;
   /** buildRequestDebugMetadata 结果；debug=false 时为 {}。 */
@@ -1483,6 +1504,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
   let lastUsage: Record<string, unknown> | null = null;
   let assistantContent = "";
   const toolCallAccumulators = new Map<number, ToolCallAccumulator>();
+  let streamFailed = ctx.upstreamStatus < 200 || ctx.upstreamStatus >= 300;
 
   function processSseChunk(chunk: string): void {
     sseBuf += chunk;
@@ -1636,7 +1658,11 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
       }
     }
 
-    if (ctx.tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
+    const memorySideEffectsAllowed = ctx.upstreamStatus >= 200
+      && ctx.upstreamStatus < 300
+      && !streamFailed;
+
+    if (memorySideEffectsAllowed && ctx.tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
       // Streaming 不 await（会拖慢 SSE 关流体感），改成 trackWrite + 重试：
       //   - trackWrite 注册 in-flight promise 到全局 set；SIGTERM 时 index.ts 会
       //     flushPendingWrites 等待或超时兜底，避免 pod rolling 时丢 L0。
@@ -1645,6 +1671,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
         withL0Retry(() => recordTdaiTurn(
           ctx.tdaiClient!, ctx.tdaiIdentity, ctx.tdaiUserMessage,
           outputMessageContent(outputMessage),
+          { turnSeq: lf.turnSeq },
         )).catch((err: unknown) => pipe.error("TDAI_L0", err))
       );
     } else if (ctx.tdaiClient) {
@@ -1655,7 +1682,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
 
     // Skill extract trigger — after stream finalization.
     // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-    if (isExtractionAllowed(ctx.config, "skill")) {
+    if (memorySideEffectsAllowed && isExtractionAllowed(ctx.config, "skill")) {
       await triggerSkillExtractIfReady({
         config: ctx.config,
         sessionKey: ctx.sessionKeyForSkill,
@@ -1713,6 +1740,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
       try {
         processSseChunk(decoder.decode(chunk, { stream: true }));
       } catch (err: unknown) {
+        streamFailed = true;
         pipe.error("STREAM_TAP", err);
       }
     },
@@ -1720,6 +1748,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
       try {
         await finalize();
       } catch (err: unknown) {
+        streamFailed = true;
         pipe.error("STREAM_FINALIZE", err);
       }
     },

@@ -47,7 +47,7 @@ if [[ -s "$ADMIN_KEY_FILE" ]]; then
   UPSTREAM_MODEL="${PROXY_UPSTREAM_MODEL:-<your-model>}"
   echo ""
   echo "  ┌─ 通过 proxy 用 Claude Code ─────────────────────────────────────┐"
-  echo "  │  export ANTHROPIC_BASE_URL=http://127.0.0.1:${PROXY_PORT}/claude-code/default"
+  echo "  │  export ANTHROPIC_BASE_URL=http://127.0.0.1:${PROXY_PORT}/claude/default"
   echo "  │  export ANTHROPIC_AUTH_TOKEN='${ADMIN_KEY}'"
   echo "  │  claude --model ${UPSTREAM_MODEL}"
   echo "  │"

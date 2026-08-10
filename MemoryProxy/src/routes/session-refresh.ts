@@ -240,7 +240,7 @@ export function createSessionRefreshHandler(config: ProxyConfig) {
     }
 
     const sessionKey = typeof body.session_key === "string" ? body.session_key : "";
-    const agentSource = typeof body.agent_source === "string" ? body.agent_source : "claude-code";
+    const agentSource = typeof body.agent_source === "string" ? body.agent_source : "claude";
     const callerUserKey = typeof body.user_key === "string" ? body.user_key : undefined;
     const spaceId = typeof body.space_id === "string" ? body.space_id : "";
 

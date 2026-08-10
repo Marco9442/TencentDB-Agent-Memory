@@ -164,6 +164,10 @@ function createPrewarmAgentContext(input: PrewarmInput): AgentContext {
 export const MEMORY_TOOLS_GUIDE = `<memory-tools-guide>
 ## ⚠️ 重要：这不是文档，这是你的可用能力
 
+## Claude Code 集成边界（必须遵守）
+
+当前绑定的是 MemoryProxy 外部记忆 Agent，不是 Claude Code 子 Agent、后台 Agent 或消息接收者。不要调用 Claude Code 的 \`Skill\` 工具（尤其是 \`memory-guidance\`），也不要调用 \`Agent\` 工具的 \`subagent_type=memory\`；这些不是当前客户端提供的记忆接口，会导致请求失败。需要查记忆时，只能使用下方列出的 Bash + curl 能力，并在当前会话中直接回答。
+
 以下 \`<tdai_memory_tools>\` 中列出的 tdai_memory_search / tdai_conversation_search
 等，是**你可以主动调用的能力**（不是仅供参考的文档）。它们通过 **Bash + curl**
 使用（见上方 \`<tdai_memory_tools>\` 段里的完整调用说明与 URL）。

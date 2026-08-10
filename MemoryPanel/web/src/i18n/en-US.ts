@@ -944,7 +944,7 @@ export const enUS = {
   // ===== ApiKeyPanel =====
   'apiKey.title': 'User_Key Management',
   'apiKey.desc':
-    'Manage your User Keys for external client access (e.g. CodeBuddy / ClaudeCode CLI).',
+    'Manage your User Keys for external client access (e.g. CodeBuddy / Claude family).',
   'apiKey.create': 'New Key',
   'apiKey.fresh.desc':
     'Here is the full Key for {{keyId}} (shown only once. Please copy and save it securely immediately. You will not be able to view it again after closing):',

@@ -180,7 +180,7 @@ interface SessionIdFields {
   team_id: string;
   agent_id: string;
   /**
-   * URL 路径侧的 agentSource（`claude-code` / `codebuddy` ...）—— 用于
+   * URL 路径侧的 agentSource（`claude` / `codebuddy` ...）—— 用于
    * Repo 三段隔离键。从 SessionStore 里存储 session 的 keyId 反解出来
    * （keyId 形如 `${agentSource}:${sessionId}`）。
    */
@@ -227,7 +227,7 @@ function stateToIdFields(
   const s = state.sessionInfo;
   if (!s.user_id || !s.team_id || !s.agent_id) return null;
   const colonIdx = matchedKey.indexOf(":");
-  const agentSource = colonIdx > 0 ? matchedKey.slice(0, colonIdx) : "claude-code";
+  const agentSource = colonIdx > 0 ? matchedKey.slice(0, colonIdx) : "unknown";
   return {
     user_id: s.user_id,
     team_id: s.team_id,
@@ -244,7 +244,7 @@ function loadSessionIdsL1(sessionKey: string): SessionIdFields | null {
   // bare 命中，命中不到再按已知 agentSource 前缀试。
   const candidates = sessionKey.includes(":")
     ? [sessionKey]
-    : [sessionKey, `codebuddy:${sessionKey}`, `claude-code:${sessionKey}`];
+    : [sessionKey, `codebuddy:${sessionKey}`, `claude:${sessionKey}`];
   for (const k of candidates) {
     const s = getSessionStore().get(k);
     if (s) return stateToIdFields(s, k);
@@ -270,10 +270,10 @@ async function loadSessionIdsL2(
   // 与 L1 一样按前缀候选跑一遍
   const candidates = sessionKey.includes(":")
     ? [sessionKey]
-    : [sessionKey, `codebuddy:${sessionKey}`, `claude-code:${sessionKey}`];
+    : [sessionKey, `codebuddy:${sessionKey}`, `claude:${sessionKey}`];
   for (const compositeKey of candidates) {
     const colonIdx = compositeKey.indexOf(":");
-    const agentSource = colonIdx > 0 ? compositeKey.slice(0, colonIdx) : "claude-code";
+    const agentSource = colonIdx > 0 ? compositeKey.slice(0, colonIdx) : "unknown";
     const sessionId = colonIdx > 0 ? compositeKey.slice(colonIdx + 1) : compositeKey;
     try {
       // spaceId 必须传 —— 拼 COS key 要用（同 handler / memory-bridge 修复）

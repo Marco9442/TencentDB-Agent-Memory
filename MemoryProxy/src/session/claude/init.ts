@@ -26,7 +26,7 @@ import {
   injectSessionContextWithToggles,
   buildSessionContextBlockWithToggles,
 } from "../context-injector.js";
-import type { MetadataClient } from "../../meta/client.js";
+import { getTeamFallbackAgentId, type MetadataClient } from "../../meta/client.js";
 import { resolvePresetIdentity, type PresetIdentity } from "../preset.js";
 
 import { buildFormResponse, FormData, MORE_LABEL } from "./form.js";
@@ -115,9 +115,14 @@ async function fetchTeamsAndAgents(
   const teamResults = await Promise.all(
     teamsRaw.map(async (t) => {
       const [agentsRaw, tasksRaw] = await Promise.all([
-        // Agents are scoped to (team, owner) — each user only sees the agents
-        // they created within the team. Tasks remain team-wide (unchanged).
-        metadataClient.listAgents(t.team_id, userId),
+        // Keep owner-scoped Agents and append only the Team-designated global
+        // Agent. Do not request the whole team list: other members' ordinary
+        // Agents must remain hidden.
+        metadataClient.listSessionAgents(
+          t.team_id,
+          userId,
+          getTeamFallbackAgentId(t),
+        ),
         metadataClient.listTasks(t.team_id),
       ]);
       const tasks: TaskInTeam[] = tasksRaw.map((tk) => ({
@@ -521,7 +526,7 @@ async function completeRegistration(
         task_id: regData.task_id,
         agent_id: regData.agent_id,
         user_id: regData.user_id,
-        source: "context_proxy:claude-code",
+        source: "context_proxy:claude",
       })
       .catch((err: unknown) => {
         console.warn(
@@ -570,7 +575,7 @@ export async function handleSessionInit(
   spaceId?: string,
   presetIdentity?: PresetIdentity,
 ): Promise<SessionInitResult> {
-  const compositeKey = `claude-code:${sessionKey}`;
+  const compositeKey = `claude:${sessionKey}`;
   if (sessionKey === "unknown" || !sessionKey) return { intercepted: false };
 
   const state = store.get(compositeKey);

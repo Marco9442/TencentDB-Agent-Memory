@@ -207,6 +207,48 @@ function matchTaskInTeam(text: string, team: TeamOption): string | undefined {
   return undefined;
 }
 
+/** Parse the answer envelopes emitted by Responses native tools. */
+function parseNativeAnswers(content: string): { agent?: string; task?: string } | null {
+  const candidates: unknown[] = [];
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    candidates.push(parsed);
+    if (parsed && typeof parsed === "object" && "result" in parsed) {
+      candidates.push((parsed as Record<string, unknown>).result);
+    }
+  } catch {
+    // OpenCode emits a human-readable string such as
+    // `User has answered your questions: "..."="Agent (12345678)"`.
+    const quoted = [...content.matchAll(/=["']([^"']+)["']/g)].map((match) => match[1].trim());
+    if (quoted.length > 0) return { agent: quoted[quoted.length - 1] };
+    return null;
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const answers = (candidate as Record<string, unknown>).answers;
+    if (!answers || typeof answers !== "object") continue;
+    const values = answers as Record<string, unknown>;
+    const read = (key: string): string | undefined => {
+      const raw = values[key];
+      if (typeof raw === "string") return raw.trim() || undefined;
+      if (Array.isArray(raw)) {
+        return typeof raw[0] === "string" ? raw[0].trim() || undefined : undefined;
+      }
+      if (raw && typeof raw === "object") {
+        const nested = (raw as Record<string, unknown>).answers;
+        if (Array.isArray(nested)) return typeof nested[0] === "string" ? nested[0].trim() || undefined : undefined;
+        if (typeof nested === "string") return nested.trim() || undefined;
+      }
+      return undefined;
+    };
+    const agent = read("agent") ?? read("q1");
+    const task = read("task") ?? read("q2");
+    if (agent || task) return { agent, task };
+  }
+  return null;
+}
+
 /**
  * 轮2 提取：从用户答复中识别 agent + task，**强制限定在已选定的 team 内**。
  * CodeBuddy: 走 `<question_answer>` XML 解析。
@@ -225,6 +267,12 @@ export function extractFromOptionText(
 
   let agentText: string | null = null;
   let taskText: string | null = null;
+
+  const native = parseNativeAnswers(content);
+  if (native) {
+    agentText = native.agent ?? null;
+    taskText = native.task ?? null;
+  }
 
   // XML parsing: CodeBuddy <question_answer> in user message.
   const xml = parseQuestionAnswerXml(content);

@@ -201,7 +201,7 @@ MemoryProxy 有独立的原生 Responses 转发通道，主要路径包括：
 
 当启用 auth 和 credit reporting 时，直接 Responses 客户端可以使用
 `codebuddy`、`codex` 或其它已配置的 `agentSource`；路径提取器会识别这些
-agent 对应的 spaceId。Claude Code 的 Anthropic 客户端使用 `claude-code`。旧的
+agent 对应的 spaceId。Claude family 的 Anthropic 客户端使用 `claude`。旧的
 `/proxy/<spaceId>/...` 前缀仍保留。
 
 对于 `POST /.../responses`，handler 保持 Responses JSON 形状，透传
@@ -368,7 +368,7 @@ Responses 路径不需要 Responses → Chat 转换层。
 | `rateLimit` | Memory 实例 × 实际模型的 Input TPM / QPM 限流 |
 | `clickhouse` | 按 turn 的用量上报（计费数据源） |
 | `creditReport` / `creditPricing` | Credit 计费上报与定价表 |
-| `upstream.agents` | 按 agent name 覆盖上游 URL + apiKey（如 `claude-code` 单独走 CCR） |
+| `upstream.agents` | 按 agent name 覆盖上游 URL + apiKey（如 `claude` 单独走 CCR） |
 
 > `injection`、`extraction`、`sessionInit`、`tdai`、`skill`、`knowledge`、`skillRuntime` 是与“记忆”直接相关的配置段，接入时优先关注它们。
 

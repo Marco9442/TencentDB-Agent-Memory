@@ -81,7 +81,7 @@ export interface AgentContextMetadata {
   keyId: string;
   modelId: string;
   stream: boolean;
-  /** Agent source name from URL path (e.g. "codebuddy", "claude-code"). */
+  /** Agent source name from URL path (e.g. "codebuddy", "claude"). */
   agentSource: string;
   /**
    * Authenticated user id (`earlyVerify.userId`). Required by hook-cache repo
@@ -296,8 +296,8 @@ export interface PrewarmInput {
    */
   userId: string;
   /**
-   * Client type from URL path (e.g. `claude-code`, `codebuddy`). Handler
-   * layer provides this; defaults to `"claude-code"` when absent.
+   * Client type from URL path or the canonical `x-client` header (e.g. `claude`,
+   * `codebuddy`). Handler layer provides this; defaults to `"claude"` when absent.
    */
   agentSource: string;
   /**

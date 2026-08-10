@@ -155,8 +155,8 @@ function buildAskUserQuestionArgs(data: FormData): { questions: CCAskQuestion[] 
 
     const pageSuffix = page.totalPages > 1 ? `（第 ${pageIndex + 1}/${page.totalPages} 页）` : "";
     questions.push({
-      question: titlePrefix + `请选择「${team.team_name}」下要使用的 Agent${pageSuffix}：`,
-      header: page.totalPages > 1 ? `Agent ${pageIndex + 1}/${page.totalPages}`.slice(0, 12) : "Agent",
+      question: titlePrefix + `请选择「${team.team_name}」下要绑定的记忆 Agent${pageSuffix}：`,
+      header: page.totalPages > 1 ? `记忆 Agent ${pageIndex + 1}/${page.totalPages}`.slice(0, 12) : "记忆 Agent",
       options: combinedOptions.slice(0, CC_MAX_OPTIONS),
       multiSelect: false,
     });

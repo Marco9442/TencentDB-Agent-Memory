@@ -6,24 +6,27 @@
  *
  * 各点详见：
  *   - types.ts —— AgentAdapter 接口 + 三个适配点的说明
- *   - claude-code.ts —— CC 特化实现（当前唯一有源码/抓包依据的客户端）
+ *   - claude.ts —— Claude family 特化实现（Claude Code/Desktop）
  *   - codebuddy.ts —— CB stub（沿用 default 行为，等抓包再补 CB 特化）
  *   - default.ts —— unknown 兜底
  */
 
 import type { AgentAdapter } from "./types.js";
-import { claudeCodeAdapter } from "./claude-code.js";
+import { claudeAdapter } from "./claude.js";
 import { codebuddyAdapter } from "./codebuddy.js";
+import { codexAdapter } from "./codex.js";
 import { defaultAdapter } from "./default.js";
 
 export type { AgentAdapter, AgentKind, RequestKind } from "./types.js";
 
 export function resolveAgentAdapter(agentSource: string): AgentAdapter {
   switch (agentSource) {
-    case "claude-code":
-      return claudeCodeAdapter;
+    case "claude":
+      return claudeAdapter;
     case "codebuddy":
       return codebuddyAdapter;
+    case "codex":
+      return codexAdapter;
     default:
       return defaultAdapter;
   }

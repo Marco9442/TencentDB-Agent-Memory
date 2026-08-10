@@ -72,7 +72,7 @@ export function getLastUserMessageText(messages: RawMessage[]): string {
 
     // Tool messages linked to a session-init tool_call are always relevant
     const tcid = (messages[i] as any).tool_call_id as string | undefined;
-    if (role === "tool" && tcid && /call_session_init_/.test(tcid)) {
+    if (role === "tool" && tcid && /call_(session_init_|memory_init_)/.test(tcid)) {
       return text;
     }
 

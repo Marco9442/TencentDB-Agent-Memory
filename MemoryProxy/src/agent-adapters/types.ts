@@ -20,7 +20,7 @@
  * 只是**取用户输入的规则**和**分类规则**按 agent 适配。
  */
 
-export type AgentKind = "claude-code" | "codebuddy" | "unknown";
+export type AgentKind = "claude" | "codebuddy" | "codex" | "unknown";
 
 export type RequestKind = "main" | "fork" | "sidequery";
 
@@ -32,7 +32,7 @@ export interface AgentAdapter {
    * 分类请求类别。用于 handler 决定后续 stage 是否绕过 injection / mem 拦截 /
    * L0 / skill buffer 等业务副作用。
    *
-   * - claude-code: 按 cache_control marker 位置 + tools/thinking 兜底三分
+ * - claude: 按 cache_control marker 位置 + tools/thinking 兜底三分
    *   （详见 docs/design/2026-07-30-cc-request-routing-plan.md）
    * - codebuddy / unknown: 恒返回 "main" —— 未研究该客户端的分类规则，保守走
    *   等价现状的老链路（不启用分流）
@@ -42,7 +42,7 @@ export interface AgentAdapter {
   /**
    * 从 user message 的 content 里提取"用户真正键入的文本"。
    *
-   * - claude-code: 取最后一个 type:"text" block（跳过前面的 <system-reminder>
+ * - claude: 取最后一个 type:"text" block（跳过前面的 <system-reminder>
    *   等 CC 内部元数据，跳过 tool_result / image / thinking 等其它 block 类型）
    * - codebuddy / unknown: 保守走"content 转 string"的老逻辑，等价现状
    *

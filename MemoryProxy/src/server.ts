@@ -48,6 +48,26 @@ export function createApp(config: ProxyConfig): Hono {
     });
   }
 
+  // The Claude family was renamed from `claude-code` to the canonical
+  // `claude` namespace.  Reject the removed path instead of silently falling
+  // through to the generic catch-all handler or creating a second namespace.
+  app.use("*", async (c, next) => {
+    const firstSegment = c.req.path.split("/").filter(Boolean)[0];
+    if (firstSegment === "claude-code") {
+      return c.json(
+        {
+          error: {
+            type: "invalid_request_error",
+            code: "legacy_agent_path_removed",
+            message: "The /claude-code path was removed; use /claude and x-client: claude.",
+          },
+        },
+        404,
+      );
+    }
+    await next();
+  });
+
   // Health check
   //
   // 多节点场景：storage 请求 cos 但降级到进程内 (fs / memory / sqlite) 时
@@ -141,9 +161,9 @@ export function createApp(config: ProxyConfig): Hono {
   app.post("/v1/moderations", (c) => handleAuxiliaryEndpoint(c, config));
 
   // Agent-prefixed routes with spaceId — 客户端标准配置格式：
-  //   CC:  ANTHROPIC_BASE_URL=http://<proxy>:8096/claude-code/<spaceId>
+  //   CC:  ANTHROPIC_BASE_URL=http://<proxy>:8096/claude/<spaceId>
   //   CB:  OPENAI_BASE_URL=http://<proxy>:8096/codebuddy/<spaceId>
-  // 路径示例: /claude-code/mem-example001/v1/messages
+  // 路径示例: /claude/mem-example001/v1/messages
   //          /codebuddy/mem-example001/v1/chat/completions
   // `/cost-guard` marker: primary handler 检测到该段后启用 cost-guard 路由；
   // 默认路径（不带 marker）则跳过 router 直接透传上游。

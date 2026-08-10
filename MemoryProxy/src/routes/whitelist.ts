@@ -126,15 +126,15 @@ const SORTED_BY_SUFFIX_LEN: readonly WhitelistEndpoint[] = [...WHITELIST_ENDPOIN
 const PROXY_PREFIX_RE = /^\/proxy\/[^/]+/;
 /**
  * Agent 前缀正则：匹配 `/{agent}[/{spaceId}]/v1/...` 两种形态。
- *   - `/claude-code/v1/messages`              → 剥 `/claude-code`
- *   - `/claude-code/{spaceId}/v1/messages`    → 剥 `/claude-code/{spaceId}`
+ *   - `/claude/v1/messages`              → 剥 `/claude`
+ *   - `/claude/{spaceId}/v1/messages`    → 剥 `/claude/{spaceId}`
  * lookahead `(?=/v1/)` 确保白名单入口 `/v1/messages` 自身不会被误剥。
  * agent 段限定为已知名字，避免误伤路径中恰好有 "v1" 字面量的其它请求。
  */
-const AGENT_PREFIX_RE = /^\/(claude-code|codebuddy|cursor|anthropic|openai|codex)(?:\/[^/]+)?(?=\/v1\/)/i;
+const AGENT_PREFIX_RE = /^\/(claude|codebuddy|cursor|anthropic|openai|codex)(?:\/[^/]+)?(?=\/v1\/)/i;
 
 /** Agent-prefixed Responses aliases without `/v1`; do not consume the protocol segment as a spaceId. */
-const AGENT_SHORT_RESPONSES_PREFIX_RE = /^\/(claude-code|codebuddy|cursor|anthropic|openai|codex)(?:\/(?!v1(?:\/|$)|responses(?:\/|$)|models(?:\/|$)|alpha(?:\/|$))[^/]+)?(?=\/(?:responses(?:\/|$)|models(?:\/|$)|alpha\/))/i;
+const AGENT_SHORT_RESPONSES_PREFIX_RE = /^\/(claude|codebuddy|cursor|anthropic|openai|codex)(?:\/(?!v1(?:\/|$)|responses(?:\/|$)|models(?:\/|$)|alpha(?:\/|$))[^/]+)?(?=\/(?:responses(?:\/|$)|models(?:\/|$)|alpha\/))/i;
 
 /** Responses clients also use the short aliases without a `/v1` segment. */
 const SHORT_RESPONSES_ALIAS_RE = /^\/(?:responses(?:\/|$)|models(?:\/|$)|alpha\/)/i;
@@ -149,7 +149,7 @@ const SHORT_RESPONSES_ALIAS_RE = /^\/(?:responses(?:\/|$)|models(?:\/|$)|alpha\/
  *   1. lookahead `(?=/)`——marker 是一个独立 segment（后面还有内容），
  *      不限定紧接 `/v1/` 还是裸尾巴。这样 marker 与客户端拼的尾巴解耦：
  *        - `/codebuddy/{spaceId}/cost-guard/chat/completions`（CB 裸尾）
- *        - `/claude-code/{spaceId}/cost-guard/v1/messages`（CC 带 /v1）
+ *        - `/claude/{spaceId}/cost-guard/v1/messages`（CC 带 /v1）
  *      两种都识别为 marker。词干 `/cost-guarded/` `/cost-guarding/`
  *      `/pre-cost-guard/` 因 lookahead 要求 `/cost-guard` 后紧邻 `/` 而被隔断。
  *   2. lookbehind `(?<=(?:/[^/]+){2,})`——marker 前必须有 ≥ 2 段非空 segment，
@@ -202,7 +202,7 @@ export function hasAnalyseMarker(requestPath: string): boolean {
  * 2. 剥离 `/cost-guard` marker（如有，见 `hasCostGuardMarker`）
  * 3. 剥离 `/analyse` marker（如有，见 `hasAnalyseMarker`）
  * 4. 剥离 `/proxy/{spaceId}` 前缀（如有）
- * 5. 剥离 `/{agent}/{spaceId}` 前缀（如 `/claude-code/{spaceId}/v1/messages`）
+ * 5. 剥离 `/{agent}/{spaceId}` 前缀（如 `/claude/{spaceId}/v1/messages`）
  */
 export function normalizeWhitelistRequestPath(requestPath: string): string {
   if (!requestPath) return "";
@@ -243,4 +243,20 @@ export function matchWhitelistEndpoint(
     if (normalized === entry.pathSuffix) return entry;
   }
   return null;
+}
+
+/**
+ * Match the canonical upstream suffix used after URL normalization.
+ *
+ * Handlers pass values such as `/messages` and `/chat/completions` to the
+ * forwarding layer after the client-facing `/v1` prefix has been removed.
+ * Those values are intentionally different from `pathSuffix`, so they need
+ * their own lookup instead of being treated as an unknown endpoint.
+ */
+export function matchWhitelistUpstreamEndpoint(
+  requestPath: string,
+): WhitelistEndpoint | null {
+  const normalized = requestPath.split("?", 1)[0] ?? "";
+  if (!normalized) return null;
+  return WHITELIST_ENDPOINTS.find((entry) => entry.upstreamEndpoint === normalized) ?? null;
 }

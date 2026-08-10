@@ -2,8 +2,8 @@
  * VersionPinRepo — Redis-backed skill version snapshot for lazy-pin.
  *
  * Each session gets a hash key: skill:vpin:{userId}:{agentSource}:{sessionId}
- *   HSET skill:vpin:u1:claude-code:sess123 skl-abc 3 skl-xyz 5
- *   EXPIRE skill:vpin:u1:claude-code:sess123 <ttl>
+ *   HSET skill:vpin:u1:claude:sess123 skl-abc 3 skl-xyz 5
+ *   EXPIRE skill:vpin:u1:claude:sess123 <ttl>
  *
  * "Only write if not exists" semantics are enforced by Lua script to avoid
  * race conditions between concurrent first-access requests within the same session.

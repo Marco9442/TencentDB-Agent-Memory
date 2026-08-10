@@ -45,7 +45,7 @@ interface IncomingMsg {
 export interface TriggerInput {
   config: ProxyConfig;
   sessionKey: string;
-  /** Client type (URL path 第一段)，用于三段隔离键；缺省 `claude-code`。 */
+  /** Client type (URL path 第一段)，用于三段隔离键；缺省 `unknown`。 */
   agentSource: string;
   sessionInfo: Record<string, unknown> | null | undefined;
   inputMessages: unknown[] | undefined;

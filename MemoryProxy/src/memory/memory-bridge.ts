@@ -104,10 +104,10 @@ function toIdFields(state: import("../session/types.js").SessionInitState | unde
  */
 function loadSessionIdsL1(sessionKey: string): SessionIdFields | null {
   let state = getSessionStore().get(sessionKey);
-  // 与 skill-bridge 对齐：尝试 codebuddy: / claude-code: 前缀兜底
+  // 与 skill-bridge 对齐：尝试 codebuddy: / claude: 前缀兜底
   if (!state && !sessionKey.includes(":")) {
     state = getSessionStore().get(`codebuddy:${sessionKey}`)
-        ?? getSessionStore().get(`claude-code:${sessionKey}`);
+        ?? getSessionStore().get(`claude:${sessionKey}`);
   }
   return toIdFields(state);
 }
@@ -129,10 +129,10 @@ async function loadSessionIdsL2(
   sessionKey: string,
 ): Promise<SessionIdFields | null> {
   // 从 sessionKey 反解 agentSource + sessionId：
-  //   "claude-code:conv-abc"  → agentSource=claude-code, sessionId=conv-abc
+  //   "claude:conv-abc"  → agentSource=claude, sessionId=conv-abc
   //   "codebuddy:conv-abc"    → agentSource=codebuddy, sessionId=conv-abc
-  //   "conv-abc" (无前缀)      → agentSource=claude-code (默认), sessionId=conv-abc
-  let agentSource = "claude-code";
+  //   "conv-abc" (无前缀)      → agentSource=unknown, sessionId=conv-abc
+  let agentSource = "unknown";
   let sessionId = sessionKey;
   const colonIdx = sessionKey.indexOf(":");
   if (colonIdx >= 0) {

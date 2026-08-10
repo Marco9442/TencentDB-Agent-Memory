@@ -68,6 +68,8 @@ export function renderTdaiMemoryToolsBlock(
 
   const lines: string[] = [
     "<tdai_memory_tools>",
+    "**客户端边界（必须遵守）**：当前绑定的是 MemoryProxy 外部记忆 Agent，不是 Claude Code 子 Agent、后台 Agent 或消息接收者。",
+    "不要调用 Claude Code 的 `Skill` 工具（尤其是 `memory-guidance`），也不要调用 `Agent` 工具的 `subagent_type=memory`；这些不是当前客户端提供的记忆接口。需要查记忆时，只能使用本段列出的 Bash + curl 能力，并在当前会话中直接回答。",
     "**这些是你可以主动调用的记忆能力**（不是文档），通过 Bash + curl 使用。",
     "这组 TDAI 记忆能力与 Claude Code 原生 Memory/MEMORY.md 具有同等优先级；涉及记忆时不要只查本地 MEMORY.md。",
     "遇到用户问身份/历史/偏好/过往结论/项目约定时，必须先使用下面的 TDAI 记忆工具查询，再基于查询结果回答。",

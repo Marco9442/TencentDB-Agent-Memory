@@ -3,7 +3,7 @@
  *
  * 拆分后的架构：
  *   - codebuddy/    → CodeBuddy 专属 session-init（ask_followup_question form, XML extractor）
- *   - claude-code/  → Claude Code 专属 session-init（AskUserQuestion form, JSON extractor, 分页）
+ *   - claude/       → Claude family 专属 session-init（AskUserQuestion form, JSON extractor, 分页）
  *   - 共享模块：store.ts, types.ts, context-injector.ts, registrar.ts
  *
  * 内核 API 调用统一走 src/meta/client.ts (MetadataClient)。
@@ -31,6 +31,16 @@ export { buildSessionInfo } from "./registrar.js";
 export { injectSessionContext, SESSION_CONTEXT_OPEN, SESSION_CONTEXT_CLOSE } from "./context-injector.js";
 export { parsePresetIdentity, resolvePresetIdentity } from "./preset.js";
 export type { PresetIdentity, PresetResolution } from "./preset.js";
+export {
+  buildNativeSelectionResponse,
+  mergeNativePromptContinuation,
+} from "./native-form.js";
+export type {
+  NativeResponsesClient,
+  NativePromptState,
+  NativeFormResponse,
+  NativeSelectionFormOptions,
+} from "./native-form.js";
 
 // ── CodeBuddy 专属模块 ─────────────────────────────────────────────────────────
 
@@ -46,22 +56,22 @@ export {
   getLastUserMessageText as getCodeBuddyLastUserMessage,
 } from "./codebuddy/index.js";
 
-// ── Claude Code 专属模块 ───────────────────────────────────────────────────────
+// ── Claude family 专属模块 ─────────────────────────────────────────────────────
 
 export {
-  handleSessionInit as handleClaudeCodeSessionInit,
-  buildFormResponse as buildClaudeCodeFormResponse,
-  containsFormTitle as containsClaudeCodeFormTitle,
-  extractFromOptionText as extractClaudeCodeFromOptionText,
-  extractStructured as extractClaudeCodeStructured,
-  resolveAgent as resolveClaudeCodeAgent,
-  resolveTask as resolveClaudeCodeTask,
+  handleSessionInit as handleClaudeSessionInit,
+  buildFormResponse as buildClaudeFormResponse,
+  containsFormTitle as containsClaudeFormTitle,
+  extractFromOptionText as extractClaudeFromOptionText,
+  extractStructured as extractClaudeStructured,
+  resolveAgent as resolveClaudeAgent,
+  resolveTask as resolveClaudeTask,
   BYPASS_MARKER as CC_BYPASS_MARKER,
   MORE_MARKER,
-  getLastUserMessageText as getClaudeCodeLastUserMessage,
-} from "./claude-code/index.js";
+  getLastUserMessageText as getClaudeLastUserMessage,
+} from "./claude/index.js";
 
-// ── 旧兼容 API（向后兼容 handler.ts 旧调用方式）─────────────────────────────────
+// ── Shared dispatcher ─────────────────────────────────────────────────────────
 
 import type { SessionInitConfig } from "../types.js";
 import { SessionStore } from "./store.js";
@@ -72,17 +82,15 @@ import {
 } from "./codebuddy/init.js";
 import {
   handleSessionInit as ccHandle,
-  SessionRequestContext as CCSessionRequestContext,
-  SessionInitResult as CCSessionInitResult,
-} from "./claude-code/init.js";
+  SessionRequestContext as ClaudeSessionRequestContext,
+} from "./claude/init.js";
 
-// Re-export the types under their old names for backward compat
-export type SessionRequestContext = CBSessionRequestContext & Partial<CCSessionRequestContext>;
+// Shared dispatcher types.
+export type SessionRequestContext = CBSessionRequestContext & Partial<ClaudeSessionRequestContext>;
 export type SessionInitResult = CBSessionInitResult;
 
 /**
- * @deprecated 请使用 handleCodeBuddySessionInit() 或 handleClaudeCodeSessionInit()。
- * 此函数根据 agentSource 参数路由到对应的实现。
+ * 根据 canonical agentSource 路由到对应的实现。
  */
 import type { MetadataClient } from "../meta/client.js";
 import type { PresetIdentity } from "./preset.js";
@@ -100,7 +108,7 @@ export async function handleSessionInit(
   spaceId?: string,
   presetIdentity?: PresetIdentity,
 ): Promise<SessionInitResult> {
-  if (agentSource === "claude-code") {
+  if (agentSource === "claude") {
     return ccHandle(
       sessionKey, userId, messages, config, store,
       // protocol MUST be forwarded — without it, applyArtifactsAndContext
@@ -120,7 +128,13 @@ export async function handleSessionInit(
   }
   return cbHandle(
     sessionKey, userId, messages, config, store,
-    { stream: reqCtx.stream, modelId: reqCtx.modelId, protocol: reqCtx.protocol },
+    {
+      stream: reqCtx.stream,
+      modelId: reqCtx.modelId,
+      protocol: reqCtx.protocol,
+      formResponse: reqCtx.formResponse,
+      nativeAgentSelection: reqCtx.nativeAgentSelection,
+    },
     metadataClient,
     userKey,
     spaceId,

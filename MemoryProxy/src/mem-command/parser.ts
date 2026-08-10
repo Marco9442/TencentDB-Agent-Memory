@@ -6,7 +6,7 @@
  * 判定规则：
  * 1. 取 messages 数组最后一条 role="user" 的消息
  * 2. 通过 agentAdapter.extractUserText 按客户端规则提取用户真实输入：
- *    - claude-code: 取最后一个 text block（跳过 <system-reminder> 前缀元数据）
+ *    - claude: 取最后一个 text block（跳过 <system-reminder> 前缀元数据）
  *    - codebuddy / unknown: 走保守的"拼接所有 text"（待抓包适配）
  * 3. trim 后以 "mem:" 开头（大小写不敏感）
  * 4. 整条消息就是命令（不是嵌在其他文字中间）

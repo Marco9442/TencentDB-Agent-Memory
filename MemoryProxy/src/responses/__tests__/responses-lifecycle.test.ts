@@ -84,6 +84,8 @@ async function finalize(
   messages: Array<Record<string, unknown>>,
   predecessorState?: Awaited<ReturnType<InMemoryResponsesRoundStore["getState"]>>,
   status = 200,
+  agentSource = "codex",
+  skipMemorySideEffects = false,
 ): Promise<void> {
   await finalizeResponsesLifecycle({
     config,
@@ -93,13 +95,14 @@ async function finalize(
     sessionKey: "session-a",
     userId: "user-a",
     userKey: "user-key",
-    agentSource: "codex",
+    agentSource,
     spaceId: "space-a",
     upstreamUrl: "http://upstream.test/v1/responses",
     status,
     stream: false,
     parsed,
     messages,
+    skipMemorySideEffects,
     sessionInfo,
     responseSessionMap: map,
     roundStore: store,
@@ -282,6 +285,69 @@ describe("Responses round lifecycle", () => {
     });
   });
 
+  it("suppresses an OpenCode title round without inheriting the previous human turn", async () => {
+    const config = testConfig();
+    const store = new InMemoryResponsesRoundStore("opencode-title-scope");
+    const map = new InMemoryCodexResponseSessionMap();
+    const l0Bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      l0Bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 });
+    }));
+
+    await finalize(
+      config,
+      store,
+      map,
+      "resp_opencode_real",
+      parsedResponse("resp_opencode_real", "completed", "hello"),
+      [{ role: "user", content: "hi" }],
+    );
+    const previous = await store.getState("resp_opencode_real");
+
+    const titlePrompt = "Generate a title for this conversation:\n";
+    await finalize(
+      config,
+      store,
+      map,
+      "resp_opencode_title",
+      parsedResponse("resp_opencode_title", "completed", "询问身份"),
+      [{ role: "user", content: titlePrompt }, { role: "user", content: "hi" }],
+      previous,
+      200,
+      "opencode",
+      true,
+    );
+
+    expect(l0Bodies).toHaveLength(1);
+    expect(l0Bodies[0].messages).toStrictEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ]);
+    const titleState = await store.getState("resp_opencode_title");
+    expect(titleState?.originalUserInput).toBe("Generate a title for this conversation:");
+    expect(titleState).not.toHaveProperty("l0Status");
+
+    // The suppression is client-scoped; the same text from another client
+    // keeps the existing behavior rather than being globally filtered.
+    await finalize(
+      config,
+      store,
+      map,
+      "resp_codex_title",
+      parsedResponse("resp_codex_title", "completed", "codex title"),
+      [{ role: "user", content: titlePrompt }],
+      previous,
+      200,
+      "codex",
+    );
+    expect(l0Bodies).toHaveLength(2);
+    expect(l0Bodies[1].messages).toStrictEqual([
+      { role: "user", content: "Generate a title for this conversation:" },
+      { role: "assistant", content: "codex title" },
+    ]);
+  });
+
   it("does not publish lifecycle state for an HTTP error with a completed-looking body", async () => {
     const config = testConfig();
     const store = new InMemoryResponsesRoundStore("http-error-scope");
@@ -307,6 +373,92 @@ describe("Responses round lifecycle", () => {
 });
 
 describe("Responses HTTP continuation", () => {
+  it("forwards an OpenCode title request but skips all memory side effects", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.upstream = { url: "http://upstream.test/v1", apiKey: "", agents: {} };
+    config.storage.backend = "memory";
+    config.log.backend = "noop";
+    config.log.file = "";
+    config.creditReport.url = "";
+    config.sessionInit.enabled = true;
+    config.sessionInit.debugForceIdentity = {
+      team_id: "team-title",
+      agent_id: "agent-title",
+      task_id: "task-title",
+    };
+    config.injection.enabled = true;
+    config.injection.injectors = ["tdai-memory"];
+    config.tdai = {
+      enabled: true,
+      endpoint: "http://tdai.test",
+      apiKey: "tdai-key",
+      serviceId: "default",
+      memory: {
+        enabled: true,
+        inject: true,
+        writeL0: true,
+        recallL1: true,
+        injectL2L3: false,
+        l1Limit: 5,
+        l2Limit: 3,
+        timeoutMs: 1000,
+      },
+    };
+
+    const upstreamBodies: Record<string, unknown>[] = [];
+    const nonUpstreamCalls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("http://upstream.test")) {
+        const body = init?.body;
+        const rawBody = body instanceof ArrayBuffer
+          ? new TextDecoder().decode(body)
+          : ArrayBuffer.isView(body)
+            ? new TextDecoder().decode(body)
+            : String(body ?? "{}");
+        upstreamBodies.push(JSON.parse(rawBody) as Record<string, unknown>);
+        return new Response(JSON.stringify({
+          id: "resp_title_http",
+          object: "response",
+          status: "completed",
+          output: [{ type: "message", content: [{ type: "output_text", text: "询问身份" }] }],
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      nonUpstreamCalls.push(url);
+      return new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const titlePrompt = "Generate a title for this conversation:\n";
+    const response = await createApp(config).request("/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-client": "opencode",
+        "x-tdai-session-key": "opencode-title-http",
+      },
+      body: JSON.stringify({
+        model: "grok-4.5",
+        input: [
+          { role: "user", content: titlePrompt },
+          { role: "user", content: "hi" },
+        ],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ id: "resp_title_http" });
+    expect(upstreamBodies).toHaveLength(1);
+    expect(upstreamBodies[0].input).toStrictEqual([
+      { role: "user", content: titlePrompt },
+      { role: "user", content: "hi" },
+    ]);
+    expect(nonUpstreamCalls).toStrictEqual([]);
+  });
+
   it("keeps client and internal identity credentials off the provider leg", async () => {
     const config = structuredClone(DEFAULT_CONFIG);
     config.upstream = { url: "http://responses.test/v1", apiKey: "server-key", agents: {} };
@@ -335,6 +487,7 @@ describe("Responses HTTP continuation", () => {
         "x-team-id": "team-a",
         "x-agent-id": "agent-a",
         "x-task-id": "task-a",
+        "x-client": "opencode",
         "x-tdai-session-key": "session-a",
       },
       body: JSON.stringify({ model: "m", input: "headers" }),
@@ -349,6 +502,7 @@ describe("Responses HTTP continuation", () => {
       "x-team-id",
       "x-agent-id",
       "x-task-id",
+      "x-client",
       "x-tdai-session-key",
     ]) {
       expect(forwardedHeaders?.has(name)).toBe(false);
@@ -436,7 +590,7 @@ describe("Responses HTTP continuation", () => {
 
     const first = await app.request("/v1/responses", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-client": "codex" },
       body: JSON.stringify({ model: "m", input: "question" }),
     });
     expect(first.status).toBe(200);
@@ -444,7 +598,7 @@ describe("Responses HTTP continuation", () => {
 
     const second = await app.request("/v1/responses", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-client": "codex" },
       body: JSON.stringify({
         model: "m",
         previous_response_id: "resp_http_A",
@@ -456,7 +610,7 @@ describe("Responses HTTP continuation", () => {
 
     const third = await app.request("/v1/responses", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-client": "codex" },
       body: JSON.stringify({
         model: "m",
         previous_response_id: "resp_http_B",

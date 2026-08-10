@@ -90,6 +90,10 @@ export const DEFAULT_CONFIG: ProxyConfig = {
     maxRetries: 3,
     injectAgentContext: true,
     injectTaskContext: true,
+    nonInteractiveFallback: {
+      enabled: true,
+      agentName: "global-agent",
+    },
     headerAutoSelect: {
       enabled: true,
       teamHeader: "x-team-id",
@@ -400,6 +404,14 @@ export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
     defaultTaskId: typeof yaml.sessionInit?.defaultTaskId === "string" && yaml.sessionInit.defaultTaskId.trim()
       ? yaml.sessionInit.defaultTaskId.trim()
       : undefined,
+    nonInteractiveFallback: {
+      enabled: yaml.sessionInit?.nonInteractiveFallback?.enabled
+        ?? DEFAULT_CONFIG.sessionInit.nonInteractiveFallback!.enabled,
+      agentName: typeof yaml.sessionInit?.nonInteractiveFallback?.agentName === "string"
+        && yaml.sessionInit.nonInteractiveFallback.agentName.trim()
+        ? yaml.sessionInit.nonInteractiveFallback.agentName.trim()
+        : DEFAULT_CONFIG.sessionInit.nonInteractiveFallback!.agentName,
+    },
     headerAutoSelect: {
       enabled: yaml.sessionInit?.headerAutoSelect?.enabled ?? DEFAULT_CONFIG.sessionInit.headerAutoSelect!.enabled,
       teamHeader: (yaml.sessionInit?.headerAutoSelect?.teamHeader ?? DEFAULT_CONFIG.sessionInit.headerAutoSelect!.teamHeader).toLowerCase(),

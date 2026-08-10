@@ -4,7 +4,7 @@
  *   - classifyRequest: 恒返回 "main"（不启用分流）
  *   - extractUserText: 把 content 数组里所有 text block 拼接
  *
- * 未来新增客户端支持时，为它单独写一个 adapter（参考 claude-code.ts），
+ * 未来新增客户端支持时，为它单独写一个 adapter（参考 claude.ts），
  * 在 index.ts 的 factory 里加分支即可。
  */
 

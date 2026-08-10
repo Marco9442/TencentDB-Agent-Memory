@@ -21,6 +21,14 @@ import {
   type CodexResponseSessionMap,
 } from "../session/codex/index.js";
 import { getSessionStore, handleSessionInit, parsePresetIdentity } from "../session/index.js";
+import type { FormData } from "../session/codebuddy/form.js";
+import type { PresetIdentity } from "../session/preset.js";
+import {
+  buildNativeSelectionResponse,
+  mergeNativePromptContinuation,
+  type NativePromptState,
+  type NativeResponsesClient,
+} from "../session/native-form.js";
 import { getMetadataClient } from "../meta/client.js";
 import { injectCodexInstructions, injectCodexSessionContext } from "../injection/agents/codex/index.js";
 import { getInjectionPipeline } from "../injection/index.js";
@@ -35,6 +43,7 @@ import { isExtractionAllowed } from "../extraction-gate.js";
 import { triggerSkillExtractIfReady } from "../skill/handler-glue.js";
 import { log } from "../report/log.js";
 import { composeUpstreamSignal } from "../common/upstream-signal.js";
+import { resolveAgentSourceFromClient } from "../client-identity.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -51,6 +60,7 @@ const SKIP_REQUEST_HEADERS = new Set([
   "x-team-id",
   "x-agent-id",
   "x-task-id",
+  "x-client",
   "x-user-id",
   "x-cb-user-id",
 ]);
@@ -123,6 +133,23 @@ function responseVisibleText(parsed: ParsedResponsesJson | ParsedResponsesStream
     const record = item as Record<string, unknown>;
     return contentText(record.content);
   }).filter(Boolean).join("\n");
+}
+
+/**
+ * OpenCode creates a separate lightweight Responses request to title a new
+ * session. The title prompt is prepended before the real conversation history
+ * and is not marked in the open Responses protocol. Keep this predicate local
+ * to the Responses memory lifecycle: filtering the shared user extractor would
+ * change Claude/Codex behavior and could make predecessor state inherit the
+ * previous human turn.
+ */
+const OPENCODE_TITLE_PROMPT = "Generate a title for this conversation:";
+
+function isOpenCodeTitleRequest(agentSource: string, messages: JsonObject[]): boolean {
+  if (agentSource !== "opencode") return false;
+  const firstUser = messages.find((message) => message.role === "user");
+  if (!firstUser) return false;
+  return contentText(firstUser.content).trim() === OPENCODE_TITLE_PROMPT;
 }
 
 function firstRealUserMessage(messages: JsonObject[]): ReturnType<typeof extractLatestUserMessage> {
@@ -331,6 +358,43 @@ function requestPath(c: Context): string {
   return c.req.url || c.req.path;
 }
 
+/**
+ * Build the Responses-native retry form used by both the first request and a
+ * continuation whose answer could not be parsed. Keeping this callback in one
+ * place prevents the continuation path from silently falling back to the
+ * generic CodeBuddy form.
+ */
+function buildNativeFormResponder(args: {
+  client: NativeResponsesClient;
+  modelId: string;
+  stream: boolean;
+  preset: PresetIdentity;
+  onPrompt: (prompt: NativePromptState) => void;
+}): (formData: FormData) => Response | import("../session/native-form.js").NativeFormResponse {
+  return (formData) => {
+    if (formData.stage !== "agent_task") return buildSessionNotInitializedResponse();
+    const team = formData.teams.find((item) => item.team_id === formData.selectedTeamId)
+      ?? formData.teams[0];
+    if (!team) return new Response("No team is available for native selection", { status: 503 });
+    if (
+      args.preset.teamId !== team.team_id
+      || !args.preset.taskId
+      || args.preset.agentId
+      || !team.tasks.some((task) => task.task_id === args.preset.taskId)
+    ) {
+      return buildSessionNotInitializedResponse();
+    }
+    const built = buildNativeSelectionResponse({
+      client: args.client,
+      modelId: args.modelId,
+      team,
+      stream: args.stream,
+    });
+    args.onPrompt(built.prompt);
+    return built;
+  };
+}
+
 interface PreparedResponsesRequest {
   body: Record<string, unknown>;
   bodyChanged: boolean;
@@ -341,6 +405,8 @@ interface PreparedResponsesRequest {
   roundStore?: ResponsesRoundStore;
   predecessorState?: ResponsesRoundState | null;
   agentSource: string;
+  /** True for OpenCode's internal title request; suppress TDAI side effects only. */
+  skipMemorySideEffects: boolean;
 }
 
 function lowerHeaders(c: Context): Record<string, string> {
@@ -380,9 +446,22 @@ async function prepareResponsesRequest(
   spaceId: string,
 ): Promise<PreparedResponsesRequest | Response> {
   const body = request.request ? { ...request.request } as Record<string, unknown> : null;
-  const agentSource = route.agentName === "openai" ? "openai" : "codex";
+  // Responses is an open protocol: the path does not identify the caller.
+  // Only a route that explicitly names a legacy provider gets a path-derived
+  // source. The default route stays generic until x-client identifies the
+  // application, so `/proxy/default/v1/responses` is not treated as Codex.
+  const agentSource = resolveAgentSourceFromClient(
+    c.req.raw.headers,
+    route.agentName ?? "responses",
+  );
   if (route.endpoint !== "responses" || !body) {
-    return { body: body ?? {}, bodyChanged: false, messages: [], agentSource };
+    return {
+      body: body ?? {},
+      bodyChanged: false,
+      messages: [],
+      agentSource,
+      skipMemorySideEffects: false,
+    };
   }
 
   let bodyChanged = false;
@@ -392,7 +471,7 @@ async function prepareResponsesRequest(
     bodyChanged ||= before !== JSON.stringify(body);
   };
 
-  const messages = responsesInputToMessages(body.input, body.instructions);
+  let messages = responsesInputToMessages(body.input, body.instructions);
   const userId = keyId || "anonymous";
   const responseMap = responseSessionMap(config, userId, spaceId, agentSource);
   const sessionInitializationEnabled = config.sessionInit.enabled || Boolean(config.sessionInit.debugForceIdentity);
@@ -419,11 +498,20 @@ async function prepareResponsesRequest(
     : null;
 
   let sessionInfo: Record<string, unknown> | null | undefined;
+  let nativePromptForContinuation: NativePromptState | undefined;
+  let sessionStore: ReturnType<typeof getSessionStore> | undefined;
+  let sessionIdentity: ReturnType<typeof buildCodexSessionIdentity> | undefined;
+  let metadataClient: ReturnType<typeof getMetadataClient> | undefined;
+  let presetIdentity: PresetIdentity | undefined;
+  let nativeClient: NativeResponsesClient | undefined;
+  let nativeSelectionEnabled = false;
+  let createdNativePrompt: NativePromptState | undefined;
+  let nativeFormResponse: ((formData: FormData) => Response | import("../session/native-form.js").NativeFormResponse) | undefined;
   if (sessionInitializationEnabled) {
     const forced = config.sessionInit.debugForceIdentity;
     if (forced) {
-      // Explicit developer/e2e bypass: Responses clients cannot answer the
-      // interactive form, but still need a real TDAI identity for L0 writes.
+      // Explicit developer/e2e bypass: skip the selection round while still
+      // providing a real TDAI identity for L0 writes.
       sessionInfo = {
         session_id: sessionKey,
         user_id: userId,
@@ -435,6 +523,8 @@ async function prepareResponsesRequest(
     const store = getSessionStore();
     const identity = buildCodexSessionIdentity(sessionKey, userId, spaceId, agentSource);
     const compositeKey = `${agentSource}:${sessionKey}`;
+    sessionStore = store;
+    sessionIdentity = identity;
     const identityHeaders = readCodexIdentityHeaders(c.req.raw.headers);
     const bindingRepo = store.getBindingRepo();
     if (bindingRepo) {
@@ -459,8 +549,22 @@ async function prepareResponsesRequest(
       }
     }
 
-    const metadataClient = config.coreSkill.endpoint
+    metadataClient = config.coreSkill.endpoint
       ? getMetadataClient(config.coreSkill, spaceId, clientKey)
+      : undefined;
+    presetIdentity = parsePresetIdentity(config.sessionInit, lowerHeaders(c));
+    nativeClient = agentSource === "codex" || agentSource === "opencode"
+      ? agentSource
+      : undefined;
+    nativeSelectionEnabled = Boolean(nativeClient && presetIdentity?.teamId && presetIdentity?.taskId);
+    nativeFormResponse = nativeSelectionEnabled && nativeClient && presetIdentity
+      ? buildNativeFormResponder({
+          client: nativeClient,
+          modelId: request.model,
+          stream: body.stream === true,
+          preset: presetIdentity,
+          onPrompt: (prompt) => { createdNativePrompt = prompt; },
+        })
       : undefined;
     const recovered = await store.getOrRecover(compositeKey, identity, {
       metadataClient,
@@ -468,21 +572,27 @@ async function prepareResponsesRequest(
     });
     if (recovered) {
       if (recovered.bypassed) return buildSessionNotInitializedResponse();
-      const validation = validateCodexBinding(
-        stateBinding(recovered),
-        identityHeaders,
-        userId,
-      );
-      if (!validation.valid) {
-        return c.json({
-          error: {
-            type: "forbidden",
-            code: "session_binding_mismatch",
-            message: "Codex Team, Agent or Task binding does not match this session",
-          },
-        }, 403);
+      // Pending native-form state has no selected Agent/Task yet; validating
+      // headers against its empty `sessionInfo` would reject the very answer
+      // needed to complete registration. Terminal bindings are validated.
+      if (recovered.status === "initialized") {
+        const validation = validateCodexBinding(
+          stateBinding(recovered),
+          identityHeaders,
+          userId,
+        );
+        if (!validation.valid) {
+          return c.json({
+            error: {
+              type: "forbidden",
+              code: "session_binding_mismatch",
+              message: "Codex Team, Agent or Task binding does not match this session",
+            },
+          }, 403);
+        }
       }
       sessionInfo = recovered.sessionInfo as unknown as Record<string, unknown> | null | undefined;
+      nativePromptForContinuation = recovered.nativePrompt;
       const sessionInjection = injectCodexSessionContext(
         body,
         recovered.agentDetail,
@@ -492,8 +602,7 @@ async function prepareResponsesRequest(
       );
       applyBody(sessionInjection.body);
     } else {
-      const preset = parsePresetIdentity(config.sessionInit, lowerHeaders(c));
-      if (!preset) return buildSessionNotInitializedResponse();
+      if (!presetIdentity) return buildSessionNotInitializedResponse();
       if (!metadataClient) {
         return c.json({ error: { type: "service_unavailable", code: "session_backend_unavailable" } }, 503);
       }
@@ -503,21 +612,52 @@ async function prepareResponsesRequest(
         messages,
         {
           ...config.sessionInit,
-          // Codex cannot answer an interactive form and must fail closed on
-          // a mismatched header rather than silently bypassing memory.
+          // A mismatched header must fail closed rather than silently bypass
+          // the memory binding. Native forms are enabled only for a validated
+          // team/task preset below.
           headerAutoSelect: config.sessionInit.headerAutoSelect
             ? { ...config.sessionInit.headerAutoSelect, onMismatch: "form" }
             : undefined,
         },
         store,
-        { stream: body.stream === true, modelId: request.model, protocol: "openai" },
+        {
+          stream: body.stream === true,
+          modelId: request.model,
+          protocol: "openai",
+          nativeAgentSelection: nativeSelectionEnabled,
+          formResponse: nativeFormResponse,
+        },
         agentSource,
         metadataClient,
         clientKey,
         spaceId,
-        preset,
+        presetIdentity,
       );
-      if (initResult.intercepted || initResult.bypassed || !initResult.sessionInfo) {
+      if (initResult.intercepted) {
+        if (initResult.responseId) await responseMap.put(initResult.responseId, sessionKey);
+        if (initResult.nativePrompt) {
+          const current = store.get(compositeKey);
+          if (current) {
+            await store.set(compositeKey, {
+              ...current,
+              nativePrompt: {
+                ...initResult.nativePrompt,
+                initialInput: body.input,
+              },
+            });
+          }
+        } else if (createdNativePrompt) {
+          const current = store.get(compositeKey);
+          if (current) {
+            await store.set(compositeKey, {
+              ...current,
+              nativePrompt: { ...createdNativePrompt, initialInput: body.input },
+            });
+          }
+        }
+        return initResult.response ?? buildSessionNotInitializedResponse();
+      }
+      if (initResult.bypassed || !initResult.sessionInfo) {
         return buildSessionNotInitializedResponse();
       }
       sessionInfo = initResult.sessionInfo as unknown as Record<string, unknown>;
@@ -533,7 +673,97 @@ async function prepareResponsesRequest(
     }
   }
 
-  if (config.injection.enabled && config.injection.injectors.length > 0 && sessionKey) {
+  // A synthetic native form response has never reached CLIProxyAPI.  On its
+  // continuation replay the original input plus the synthetic function call,
+  // and remove only that synthetic previous_response_id before forwarding.
+  if (nativePromptForContinuation) {
+    const currentInput = body.input;
+    const hasFunctionOutput = Array.isArray(currentInput) && currentInput.some((item) => (
+      item && typeof item === "object" && (item as Record<string, unknown>).type === "function_call_output"
+    ));
+    if (hasFunctionOutput) {
+      applyBody({ input: mergeNativePromptContinuation(nativePromptForContinuation, currentInput) });
+      if (body.previous_response_id === nativePromptForContinuation.responseId) {
+        const before = JSON.stringify(body);
+        delete body.previous_response_id;
+        bodyChanged ||= before !== JSON.stringify(body);
+      }
+      messages = responsesInputToMessages(body.input, body.instructions);
+
+      // The first request stores a pending session-init state and returns the
+      // synthetic native form before reaching the provider. On the answer
+      // continuation, advance that same state machine before forwarding the
+      // replay so the selected Agent/Task becomes the TDAI identity used by
+      // injection and L0 persistence.
+      if (sessionStore && sessionIdentity && nativeClient) {
+        if (!metadataClient || !presetIdentity) {
+          return c.json({ error: { type: "service_unavailable", code: "session_backend_unavailable" } }, 503);
+        }
+        const compositeKey = `${agentSource}:${sessionKey}`;
+        const continuationResult = await handleSessionInit(
+          sessionKey,
+          userId || null,
+          messages,
+          {
+            ...config.sessionInit,
+            headerAutoSelect: config.sessionInit.headerAutoSelect
+              ? { ...config.sessionInit.headerAutoSelect, onMismatch: "form" }
+              : undefined,
+          },
+          sessionStore,
+          {
+            stream: body.stream === true,
+            modelId: request.model,
+            protocol: "openai",
+            nativeAgentSelection: nativeSelectionEnabled,
+            formResponse: nativeFormResponse,
+          },
+          agentSource,
+          metadataClient,
+          clientKey,
+          spaceId,
+          presetIdentity,
+        );
+
+        if (continuationResult.intercepted) {
+          if (continuationResult.responseId) {
+            await responseMap.put(continuationResult.responseId, sessionKey);
+          }
+          const prompt = continuationResult.nativePrompt ?? createdNativePrompt;
+          const current = sessionStore.get(compositeKey);
+          if (current && prompt) {
+            await sessionStore.set(compositeKey, {
+              ...current,
+              nativePrompt: {
+                ...prompt,
+                initialInput: nativePromptForContinuation.initialInput ?? body.input,
+              },
+            });
+          }
+          return continuationResult.response ?? buildSessionNotInitializedResponse();
+        }
+        if (continuationResult.bypassed || !continuationResult.sessionInfo) {
+          return buildSessionNotInitializedResponse();
+        }
+        sessionInfo = continuationResult.sessionInfo as unknown as Record<string, unknown>;
+        const sessionInjection = injectCodexSessionContext(
+          body,
+          continuationResult.agentDetail,
+          continuationResult.taskDetail,
+          config.sessionInit,
+          sessionKey,
+        );
+        applyBody(sessionInjection.body);
+      }
+    }
+  }
+
+  // The title request is still forwarded upstream unchanged, but must not
+  // perform memory recall/tool injection. Compute this after native-form
+  // continuation because that branch may replace `messages`.
+  const skipMemorySideEffects = isOpenCodeTitleRequest(agentSource, messages);
+
+  if (!skipMemorySideEffects && config.injection.enabled && config.injection.injectors.length > 0 && sessionKey) {
     try {
       const traceId = crypto.randomUUID();
       const pipelineBaseMessages = responsesInputToMessages(body.input, body.instructions);
@@ -577,6 +807,7 @@ async function prepareResponsesRequest(
     roundStore,
     predecessorState,
     agentSource,
+    skipMemorySideEffects,
   };
 }
 
@@ -603,6 +834,7 @@ function publishResponsesCompletion(args: {
   stream: boolean;
   parsed: ParsedResponsesJson | ParsedResponsesStream;
   messages: JsonObject[];
+  skipMemorySideEffects?: boolean;
   sessionInfo?: Record<string, unknown> | null;
   responseSessionMap?: CodexResponseSessionMap;
   roundStore?: ResponsesRoundStore;
@@ -646,6 +878,8 @@ function publishResponsesCompletion(args: {
     ])];
     const roundComplete = finalCandidate && pendingCallIds.length === 0;
     const l0Expected = Boolean(
+      !args.skipMemorySideEffects
+      &&
       args.sessionInfo
       && args.sessionKey
       && args.config.tdai.enabled
@@ -707,6 +941,7 @@ export async function finalizeResponsesLifecycle(args: {
   stream: boolean;
   parsed: ParsedResponsesJson | ParsedResponsesStream;
   messages: JsonObject[];
+  skipMemorySideEffects?: boolean;
   sessionInfo?: Record<string, unknown> | null;
   responseSessionMap?: CodexResponseSessionMap;
   roundStore?: ResponsesRoundStore;
@@ -737,6 +972,11 @@ export async function finalizeResponsesLifecycle(args: {
     usage,
     protocol: "openai",
   }).catch(() => undefined);
+
+  // Keep usage, response/session maps, and Responses round state intact so the
+  // client receives its normal title response. Only TDAI memory side effects
+  // are suppressed for this internal OpenCode request.
+  if (args.skipMemorySideEffects) return;
 
   const id = publication.id;
   if (!publication.finalCandidate || !id || !args.roundStore) return;
@@ -913,6 +1153,7 @@ export async function handleResponses(
       stream: false,
       parsed,
       messages: lifecycle.messages,
+      skipMemorySideEffects: lifecycle.skipMemorySideEffects,
       sessionInfo: lifecycle.sessionInfo,
       responseSessionMap: lifecycle.responseSessionMap,
       roundStore: lifecycle.roundStore,
@@ -953,6 +1194,7 @@ export async function handleResponses(
         stream: true,
         parsed,
         messages: lifecycle.messages,
+        skipMemorySideEffects: lifecycle.skipMemorySideEffects,
         sessionInfo: lifecycle.sessionInfo,
         responseSessionMap: lifecycle.responseSessionMap,
         roundStore: lifecycle.roundStore,

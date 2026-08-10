@@ -15,7 +15,7 @@
 #
 # 配置文件格式（面板下载）:
 #   {
-#     "endpoint":   "https://proxy.xxx/claude-code",
+#     "endpoint":   "https://proxy.xxx/claude",
 #     "token":      "tdai_xxxxxxxxxxxxxxxxxxxxxxxx",
 #     "headerName": "X-Tdai-User-Token"
 #   }
@@ -40,7 +40,7 @@ Usage:
   setup-claude-code.sh --uninstall [--scope user|project]
 
 Options:
-  --endpoint     Proxy endpoint URL,  e.g. https://proxy.xxx/claude-code
+  --endpoint     Proxy endpoint URL,  e.g. https://proxy.xxx/claude
   --token        User token from dashboard, e.g. tdai_xxxxxxxx
   --header-name  Custom header name (default: X-Tdai-User-Token)
   --config       Read endpoint/token/headerName from a JSON file
@@ -51,7 +51,7 @@ Options:
   -h, --help     Show this help
 
 Examples:
-  setup-claude-code.sh --endpoint https://proxy.xxx/claude-code --token tdai_abc
+  setup-claude-code.sh --endpoint https://proxy.xxx/claude --token tdai_abc
   setup-claude-code.sh --config ~/Downloads/tdai-claude-code.json
   setup-claude-code.sh --uninstall
 EOF

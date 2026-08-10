@@ -36,7 +36,7 @@ export interface ClientIdentity {
   customHeaders: Record<string, string>;
   /** Extracted from system prompt <user_info> if present */
   userInfo: UserInfoFromPrompt | null;
-  /** Agent source name from URL path (e.g. "codebuddy", "claude-code"). */
+  /** Agent source name from URL path (e.g. "codebuddy", "claude"). */
   agentSource: string;
   /** Proxy-issued user token from `X-Tdai-User-Token` header (panel-generated). */
   proxyToken: string | null;
@@ -105,7 +105,7 @@ export function getRecentInspections(): RequestInspection[] {
 export function extractClientIdentity(
   headers: Record<string, string>,
   body?: Record<string, unknown>,
-  agentSource = "claude-code",
+  agentSource = "unknown",
 ): ClientIdentity {
   // Extract API key
   const authHeader = headers["authorization"] ?? headers["Authorization"] ?? "";
@@ -329,7 +329,7 @@ export function inspectAndRecord(
   path: string,
   headers: Record<string, string>,
   body: Record<string, unknown>,
-  agentSource = "claude-code",
+  agentSource = "unknown",
 ): ClientIdentity {
   const identity = extractClientIdentity(headers, body, agentSource);
 

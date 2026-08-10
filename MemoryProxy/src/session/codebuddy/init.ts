@@ -22,10 +22,13 @@ import { DEFAULT_TASK_LABEL } from "../types.js";
 import { SessionStore } from "../store.js";
 import { buildSessionInfo } from "../registrar.js";
 import { injectSessionContextWithToggles } from "../context-injector.js";
-import type { MetadataClient } from "../../meta/client.js";
+import { getTeamFallbackAgentId, type MetadataClient } from "../../meta/client.js";
 import { resolvePresetIdentity, type PresetIdentity } from "../preset.js";
+import { isNonInteractiveClientSource } from "../../client-identity.js";
+import { resolveNonInteractiveFallback } from "../noninteractive-fallback.js";
 
 import { buildFormResponse, FormData } from "./form.js";
+import type { NativeFormResponse } from "../native-form.js";
 import {
   extractFromOptionText,
   extractTeamFromOptionText,
@@ -43,6 +46,10 @@ export interface SessionRequestContext {
   stream: boolean;
   modelId: string;
   protocol?: "openai" | "anthropic";
+  /** Optional client-native form builder (Responses Codex/OpenCode). */
+  formResponse?: (data: FormData) => Response | NativeFormResponse;
+  /** Force the preset-team path to ask only for an Agent with the native form. */
+  nativeAgentSelection?: boolean;
 }
 
 export interface SessionInitResult {
@@ -57,16 +64,30 @@ export interface SessionInitResult {
   bypassed?: boolean;
   /**
    * Anthropic-only: pre-built `<session_context>` string the caller must
-   * append to `body.system` (the ClaudeCode init module populates this;
+   * append to `body.system` (the Claude init module populates this;
    * CodeBuddy stays OpenAI so it is always undefined here). Kept in this
    * interface so `session/index.ts`'s union type stays uniform.
    */
   systemAppend?: string | null;
+  responseId?: string;
+  nativePrompt?: import("../native-form.js").NativePromptState;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 type MessageArr = Record<string, unknown>[];
+
+function buildFormResult(reqCtx: SessionRequestContext, data: FormData): SessionInitResult {
+  const built = reqCtx.formResponse?.(data);
+  if (!built) return { intercepted: true, response: buildFormResponse(data) };
+  if (built instanceof Response) return { intercepted: true, response: built };
+  return {
+    intercepted: true,
+    response: built.response,
+    responseId: built.responseId,
+    nativePrompt: built.prompt,
+  };
+}
 
 /** 判断是否是「全新」CodeBuddy 对话（最多一条 user、无 assistant/tool）。 */
 function isFreshCBConversation(messages: MessageArr): boolean {
@@ -92,16 +113,21 @@ async function fetchTeamsAndAgents(
   const teamResults = await Promise.all(
     teamsRaw.map(async (t) => {
       const [agentsRaw, tasksRaw] = await Promise.all([
-        // Agents are scoped to (team, owner) — each user only sees the agents
-        // they created within the team. Tasks remain team-wide (unchanged).
-        metadataClient.listAgents(t.team_id, userId),
+        // Keep owner-scoped Agents and append only the Team-designated global
+        // Agent. Do not request the whole team list: other members' ordinary
+        // Agents must remain hidden.
+        metadataClient.listSessionAgents(
+          t.team_id,
+          userId,
+          getTeamFallbackAgentId(t),
+        ),
         metadataClient.listTasks(t.team_id),
       ]);
       const tasks: TaskInTeam[] = tasksRaw.map((tk) => ({
         task_id: tk.task_id,
         task_name: tk.title,
       }));
-      // 见 claude-code/init.ts fetchTeamsAndAgents 的同款注释：defaultTaskId
+      // 见 claude/init.ts fetchTeamsAndAgents 的同款注释：defaultTaskId
       // 在源头 unshift 到 tasks 列表头部，下游 form/extractor 走既有路径。
       if (config.defaultTaskId) {
         tasks.unshift({
@@ -193,6 +219,7 @@ async function completeRegistration(
   metadataClient?: MetadataClient,
   userKey?: string,
   spaceId?: string,
+  agentSource = "codebuddy",
 ): Promise<SessionInitResult> {
   const regUserId = (state as any).userId || userId;
   if (!regUserId) {
@@ -253,7 +280,7 @@ async function completeRegistration(
       `agent=${resolved.agent_id} task=${regData.task_id ?? "-"} team=${regData.team_id} user=${sessionInfo.user_id}`,
   );
 
-  // Fire-and-forget: 记录参与日志（对齐 claude-code 分支，源标记为 codebuddy）。
+  // Fire-and-forget: 记录参与日志（对齐 claude 分支，源标记为 codebuddy）。
   // bypass 场景已在上方 return，天然被过滤；失败仅 warn，不阻断注入。
   if (
     metadataClient &&
@@ -266,7 +293,7 @@ async function completeRegistration(
         task_id: regData.task_id,
         agent_id: regData.agent_id,
         user_id: regData.user_id,
-        source: "context_proxy:codebuddy",
+        source: `context_proxy:${agentSource}`,
       })
       .catch((err: unknown) => {
         console.warn(
@@ -426,8 +453,12 @@ export async function handleSessionInit(
           { agent_id: pr.agentId!, task_id: pr.taskId },
           seedState, teams, compositeKey, sessionKey, userId,
           config, store, messages, metadataClient, userKey, spaceId,
+          agentSource,
         );
-      } else if (pr.teamId) {
+      } else if (
+        pr.teamId &&
+        (reqCtx.nativeAgentSelection ? Boolean(pr.taskId) : !isNonInteractiveClientSource(agentSource))
+      ) {
         // only team resolved → jump straight to agent+task selection (skip asset_confirm + team_select)
         await store.set(compositeKey, {
           status: "pending_agent_task",
@@ -449,7 +480,60 @@ export async function handleSessionInit(
           modelId: reqCtx.modelId,
           protocol: reqCtx.protocol,
         };
-        return { intercepted: true, response: buildFormResponse(fd) };
+        return buildFormResult(reqCtx, fd);
+      }
+    }
+
+    // If a Codex/OpenCode request cannot use the native selection path (for
+    // example a non-interactive invocation or missing task header), use only
+    // the team-designated global Agent. A valid x-agent-id still wins via the
+    // normal header pre-selection path above; a malformed identity never falls
+    // through to this automatic binding.
+    const resolvedPreset = presetIdentity
+      ? resolvePresetIdentity(teams, presetIdentity)
+      : undefined;
+    if (
+      isNonInteractiveClientSource(agentSource) &&
+      config.nonInteractiveFallback?.enabled !== false &&
+      !resolvedPreset?.hadMismatch
+    ) {
+      if (!resolvedPreset?.agentId) {
+        const fallback = resolveNonInteractiveFallback(teams, {
+          teamId: resolvedPreset?.teamId,
+          taskId: resolvedPreset?.taskId,
+          defaultTaskId: config.defaultTaskId,
+          agentName: config.nonInteractiveFallback?.agentName ?? "global-agent",
+        });
+        if (fallback) {
+          console.log(
+            `[session-init:${agentSource}] session=${compositeKey} ` +
+            `fallback agent=${fallback.agentId} task=${fallback.taskId} team=${fallback.teamId}`,
+          );
+          const seedState: SessionInitState = {
+            status: "uninitialized",
+            keyId: sessionKey,
+            startedAt: Date.now(),
+            attemptCount: 0,
+            userId,
+            cachedTeams: teams,
+            selectedTeamId: fallback.teamId,
+          };
+          return completeRegistration(
+            { agent_id: fallback.agentId, task_id: fallback.taskId },
+            seedState,
+            teams,
+            compositeKey,
+            sessionKey,
+            userId,
+            config,
+            store,
+            messages,
+            metadataClient,
+            userKey,
+            spaceId,
+            agentSource,
+          );
+        }
       }
     }
 
@@ -472,7 +556,7 @@ export async function handleSessionInit(
       modelId: reqCtx.modelId,
       protocol: reqCtx.protocol,
     };
-    return { intercepted: true, response: buildFormResponse(fd) };
+    return buildFormResult(reqCtx, fd);
   }
 
   // ── Case 1.25: Awaiting asset_confirm ────────────────────────────────────
@@ -523,7 +607,7 @@ export async function handleSessionInit(
           modelId: reqCtx.modelId,
           protocol: reqCtx.protocol,
         };
-        return { intercepted: true, response: buildFormResponse(fd) };
+        return buildFormResult(reqCtx, fd);
       }
 
       await store.set(compositeKey, {
@@ -544,7 +628,7 @@ export async function handleSessionInit(
         modelId: reqCtx.modelId,
         protocol: reqCtx.protocol,
       };
-      return { intercepted: true, response: buildFormResponse(fd) };
+      return buildFormResult(reqCtx, fd);
     }
 
     state.attemptCount++;
@@ -562,7 +646,7 @@ export async function handleSessionInit(
       modelId: reqCtx.modelId,
       protocol: reqCtx.protocol,
     };
-    return { intercepted: true, response: buildFormResponse(fd) };
+    return buildFormResult(reqCtx, fd);
   }
 
   // ── Case 1.5: Awaiting team selection ─────────────────────────────────────
@@ -587,7 +671,7 @@ export async function handleSessionInit(
         modelId: reqCtx.modelId,
         protocol: reqCtx.protocol,
       };
-      return { intercepted: true, response: buildFormResponse(fd) };
+      return buildFormResult(reqCtx, fd);
     }
 
     state.attemptCount++;
@@ -605,7 +689,7 @@ export async function handleSessionInit(
       modelId: reqCtx.modelId,
       protocol: reqCtx.protocol,
     };
-    return { intercepted: true, response: buildFormResponse(fd) };
+    return buildFormResult(reqCtx, fd);
   }
 
   // ── Case 2: Awaiting agent + task selection ───────────────────────────────
@@ -627,12 +711,20 @@ export async function handleSessionInit(
 
     if (extracted) {
       const resolvedAgentId = resolveAgent(extracted.agent_id, cachedTeams, selectedTeamId);
-      const resolvedTaskId = resolveTask(
+      const extractedTaskId = resolveTask(
         extracted.task_id,
         cachedTeams,
         resolvedAgentId,
         selectedTeamId,
       );
+      // Responses native forms ask only for the Agent.  The task was already
+      // supplied in x-task-id and is validated against the same selected Team.
+      const presetTaskId = presetIdentity?.taskId && presetIdentity.teamId === selectedTeamId
+        && cachedTeams.find((team) => team.team_id === selectedTeamId)?.tasks
+          .some((task) => task.task_id === presetIdentity.taskId)
+        ? presetIdentity.taskId
+        : undefined;
+      const resolvedTaskId = extractedTaskId ?? presetTaskId;
       const resolved: SessionInitData = {
         agent_id: resolvedAgentId,
         task_id: resolvedTaskId,
@@ -641,6 +733,7 @@ export async function handleSessionInit(
       return await completeRegistration(
         resolved, state, cachedTeams, compositeKey, sessionKey, userId,
         config, store, messages, metadataClient, userKey, spaceId,
+        agentSource,
       );
     }
 
@@ -661,7 +754,7 @@ export async function handleSessionInit(
       modelId: reqCtx.modelId,
       protocol: reqCtx.protocol,
     };
-    return { intercepted: true, response: buildFormResponse(fd) };
+    return buildFormResult(reqCtx, fd);
   }
 
   // ── Case 3: Initialized ───────────────────────────────────────────────────

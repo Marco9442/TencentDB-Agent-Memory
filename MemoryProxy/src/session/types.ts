@@ -57,7 +57,7 @@ export interface SessionInitState {
    * 渲染 3 个 agent + 1 个"更多→"或"本次不关联"槽位，用户点"更多"则 pageIndex++
    * 再发下一页 form。详见 docs/reports/2026-06-19-cc-form-mode-experiment.md §4.4。
    *
-   * - 仅 Claude Code（agentSource="claude-code"）使用，CodeBuddy 走 ask_followup_question
+   * - 仅 Claude family（agentSource="claude"）使用，CodeBuddy 走 ask_followup_question
    *   没有 4 选项限制，无需分页。
    * - 仅在 status="pending_agent_task" 期间有效。
    * - 默认 0（首页）；每次用户选"更多"，handler 把它 +1 重发 form。
@@ -74,6 +74,8 @@ export interface SessionInitState {
    * 但 agentDetail/taskDetail 为 null，后续请求只 strip 不 inject。
    */
   bypassed?: boolean;
+  /** Synthetic Responses native-form prompt awaiting a client selection. */
+  nativePrompt?: import("./native-form.js").NativePromptState;
 }
 
 /**

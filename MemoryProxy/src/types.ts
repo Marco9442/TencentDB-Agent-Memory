@@ -28,7 +28,7 @@ export interface CostGuardConfig {
    */
   markerOptIn?: boolean;
   /**
-   * Pin the agent profile by id ("claude-code", "codebuddy").
+   * Pin the agent profile by id ("claude", "codebuddy").
    * Empty or "auto" (default) = auto-detect from request headers.
    */
   agentProfile?: string;
@@ -233,6 +233,15 @@ export interface SessionInitConfig {
    * 若未配置，task_select 阶段不会出现"跳过"选项。
    */
   defaultTaskId?: string;
+  /**
+   * Automatic binding for clients that cannot answer the proxy's selection
+   * form (currently Codex/OpenCode Responses). The selected Agent must be
+   * the team-designated, visibility=team `global-agent`.
+   */
+  nonInteractiveFallback?: {
+    enabled: boolean;
+    agentName: string;
+  };
   headerAutoSelect?: {
     /** 是否启用 header 自动预选。默认 true。 */
     enabled: boolean;
@@ -328,7 +337,7 @@ export interface SkillRuntimeConfig {
 
 /**
  * Per-agent upstream override entry. When an agent (identified by URL path
- * prefix like "claude-code") needs a different upstream than the global
+ * prefix like "claude") needs a different upstream than the global
  * default, this struct provides the replacement `url` (and optional `apiKey`).
  *
  * Fallback semantics — three cases, matching the runtime `effectiveApiKey`
@@ -382,7 +391,7 @@ export interface ProxyConfig {
     url: string; // OpenAI-compatible upstream URL
     apiKey: string; // 若非空则替换请求中的 API Key
     /**
-     * Per-agent overrides keyed by agent name (URL path prefix, e.g. "claude-code").
+     * Per-agent overrides keyed by agent name (URL path prefix, e.g. "claude").
      * Empty / missing entry → agent falls back to `url` + `apiKey`.
      */
     agents: Record<string, AgentUpstreamEntry>;
@@ -759,6 +768,10 @@ export interface RawYamlConfig {
     injectAgentContext?: boolean;
     injectTaskContext?: boolean;
     defaultTaskId?: string;
+    nonInteractiveFallback?: {
+      enabled?: boolean;
+      agentName?: string;
+    };
     debugForceIdentity?: {
       team_id?: string;
       agent_id?: string;

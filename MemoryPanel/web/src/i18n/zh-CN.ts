@@ -902,7 +902,7 @@ export const zhCN = {
 
   // ===== ApiKeyPanel =====
   'apiKey.title': 'User_Key 管理',
-  'apiKey.desc': '管理你的 User Key，用于外部客户端接入（如 CodeBuddy / ClaudeCode CLI）。',
+  'apiKey.desc': '管理你的 User Key，用于外部客户端接入（如 CodeBuddy / Claude family）。',
   'apiKey.create': '新建 Key',
   'apiKey.fresh.desc':
     '以下是 {{keyId}} 的完整 Key（仅展示这一次，请立即复制并安全保存；关闭后将无法再次查看明文）：',

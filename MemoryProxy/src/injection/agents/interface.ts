@@ -50,7 +50,7 @@ export interface ResolvedAnchor {
  * Agent adaptation layer. One implementation per agent.
  */
 export interface AgentProfile {
-  /** Agent identifier ("codebuddy" | "claude-code" | ...). */
+  /** Agent identifier ("codebuddy" | "claude" | ...). */
   readonly id: string;
   /** Underlying wire protocol (selects which ProtocolAdapter does parse/serialize). */
   readonly protocol: Protocol;

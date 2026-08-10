@@ -202,7 +202,7 @@ are `POST`.
 
 Use `codebuddy` as the `agentSource` for a direct Responses client when auth and
 credit reporting are enabled; the current path extractor recognizes it as a
-space-bearing agent. Use `claude-code` for Claude Code's Anthropic client. The
+space-bearing agent. Use `claude` for the Claude family's Anthropic client. The
 legacy `/proxy/<spaceId>/...` prefix remains available.
 
 For `POST /.../responses`, the handler preserves the Responses JSON shape and
@@ -218,12 +218,15 @@ are removed at the proxy boundary.
 The native Responses handler is separate from the Chat/Messages wire adapter
 but reuses the shared session and memory services. With
 `sessionInit.enabled=true`, it validates the authenticated user's visible
-Team/Agent/Task headers, registers or recovers a Codex session, maps
-`previous_response_id` back to that session, and returns structured `409` when
-the non-interactive binding is missing. Configured injection blocks are merged
-into `instructions`; completed final responses can write one deduplicated L0
-turn and trigger Skill extraction. Client credentials and internal identity
-headers are used by MemoryProxy only and are not forwarded to the provider.
+Team/Agent/Task headers, registers or recovers a session in the client-specific
+namespace, and maps `previous_response_id` back to that session. The protocol
+does not identify the caller by itself: send `x-client: claude`, `codex`, or
+`opencode`. Codex/OpenCode can omit `x-agent-id` when the configured team-wide
+`global-agent` fallback is unambiguous; otherwise a structured `409` is
+returned. Configured injection blocks are merged into `instructions`; completed
+final responses can write one deduplicated L0 turn and trigger Skill extraction.
+Client credentials and internal identity headers are used by MemoryProxy only
+and are not forwarded to the provider.
 
 ### Headless clients: headers and session binding
 
@@ -240,10 +243,14 @@ x-conversation-id: <stable-conversation-id>
 
 The `team_id`, `agent_id` and `task_id` values are checked against the metadata
 visible to the authenticated user; headers are not trusted blindly. With
-`sessionInit.headerAutoSelect.enabled=true`, all three identity headers and a
-valid session header let the Chat/Messages or native Responses handler register
-the session without the interactive form. A missing or invalid binding returns
-structured `409` on native Responses and is not forwarded to the provider.
+`sessionInit.headerAutoSelect.enabled=true`, valid identity headers and a valid
+session header let the Chat/Messages or native Responses handler register the
+session without the interactive form. Claude clients can still use their native
+selection form. For Codex/OpenCode, `x-client` plus a valid team/task invokes
+the client's native single-choice form when `x-agent-id` is absent. If the
+invocation cannot display a form, the configured team-wide fallback is used; a
+missing or ambiguous binding returns structured `409` and is not forwarded to
+the provider.
 
 The session binding is effectively:
 
@@ -256,7 +263,8 @@ headers, `prompt_cache_key`, `conversation.id`, and only then a scoped
 `previous_response_id` mapping. Reuse one value for one conversation and
 generate a new value for a new conversation. With Responses session-init
 enabled, missing Team/Agent/Task/session binding is rejected instead of being
-silently bypassed.
+silently bypassed, except for the explicitly configured Codex/OpenCode
+`global-agent` fallback.
 
 ### Codex
 
@@ -275,8 +283,8 @@ env_key = "MEMORY_PROXY_API_KEY"
 wire_api = "responses"
 requires_openai_auth = true
 http_headers = {
+  "x-client" = "codex",
   "x-team-id" = "<team_id>",
-  "x-agent-id" = "<agent_id>",
   "x-task-id" = "<task_id>",
   "x-conversation-id" = "<stable-conversation-id>"
 }
@@ -380,7 +388,7 @@ Config sections at a glance:
 | `rateLimit` | Input TPM / QPM limiting per memory instance × actual model |
 | `clickhouse` | per-turn usage reporting (billing data source) |
 | `creditReport` / `creditPricing` | Credit billing report and pricing table |
-| `upstream.agents` | override upstream URL + apiKey per agent name (e.g. route `claude-code` through CCR) |
+| `upstream.agents` | override upstream URL + apiKey per agent name (e.g. route `claude` through CCR) |
 
 > `injection`, `extraction`, `sessionInit`, `tdai`, `skill`, `knowledge`, `skillRuntime` are the memory-related sections — focus on them first when integrating.
 

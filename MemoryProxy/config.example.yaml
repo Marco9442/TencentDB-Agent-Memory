@@ -18,8 +18,9 @@
 #   /v1/responses、/<agentSource>/<spaceId>/v1/responses、
 #   /proxy/<spaceId>/v1/responses （原生 OpenAI Responses）
 #   Responses 的 input/instructions/未知 JSON 字段与 model 别名均保持语义；
-#   JSON/SSE 响应透明返回。启用 sessionInit 时 Team/Agent/Task 与 session
-#   header 会经当前用户可见资源校验，缺少有效绑定返回 409。
+#   JSON/SSE 响应透明返回。Responses 是开放协议，客户端身份由可选的 x-client
+#   header 标识，不由 /responses 路径猜测；Codex/OpenCode 可用 team-wide
+#   global-agent 兜底，无法安全绑定时才返回 409。
 #   Chat/Messages 的无交互客户端仍应持续携带 x-team-id / x-agent-id /
 #   x-task-id 与 x-conversation-id，否则既有 session init/注入可能被跳过。
 #
@@ -80,7 +81,7 @@ upstream:
     # codebuddy:                                           # 推荐给原生 Responses 客户端
     #   url: "http://127.0.0.1:8317/v1"                  # 例如 CLIProxyAPI / CC Switch
     #   apiKey: "<CLIPROXYAPI_API_KEY>"                  # 上游 provider key
-    # claude-code:                                        # 服务端 key 模式
+    # claude:                                             # 服务端 key 模式
     #   url: "https://claude-upstream.example.com/v1"
     #   apiKey: "sk-ant-agent-key"
     # codex:                                              # Responses 路由已注册
@@ -494,9 +495,9 @@ extraction:
 #   4. 选择 task（交互式流程可跳过；无交互 header 直登需要 task_id）
 #   5. 注册会话 → 注入 agent/task 上下文到 system prompt
 #
-# 原生 Responses 也接入该流程：无交互请求必须携带有效 Team/Agent/Task 与
-# session key；`previous_response_id` 只通过持久化映射恢复真实 session，不作为
-# 永久 session ID。无效或缺失绑定返回结构化 409，不进入上游。
+# 原生 Responses 也接入该流程：请求需要稳定 session key。Codex/OpenCode 可通过
+# x-client + team/task header 使用 team-wide global-agent 兜底；其它无效或缺失绑定
+# 仍返回结构化 409，不进入上游。
 #
 # 状态存储：默认 Redis（redis.enabled=true）；启用 storage.enabled=true 后走
 # ProxyStorage（COS/SQLite/FS）。都不启用则回落 SQLite 单实例本地存储。
@@ -520,6 +521,12 @@ sessionInit:
   # 关闭时每个 session 只 warn 一次（避免长会话刷屏）。
   injectAgentContext: true  # false = 不注入 [Agent] 段（id/name/description/prompt）
   injectTaskContext: true   # false = 不注入 [Task] 段（id/name/description/goal）
+  # Responses 客户端按 x-client 使用原生选择工具：Codex=request_user_input，
+  # OpenCode=question。非交互调用或无法展示原生表单时，若请求没有有效
+  # x-agent-id，则只自动绑定 team-wide、visibility=team 的 global-agent。
+  nonInteractiveFallback:
+    enabled: true
+    agentName: global-agent
   # header 自动预选：首轮请求头已带身份字段时，去列表里校验存在性，命中则跳过对应选择步骤。
   # 无交互客户端要同时提供有效的 team/agent/task；当前直接注册路径中
   # task_id 是必填的。header 值只接受当前鉴权用户可见的元数据。

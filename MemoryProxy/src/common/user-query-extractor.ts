@@ -69,7 +69,7 @@ const CC_INTERNAL_PROMPT_PATTERNS: RegExp[] = [
   //     只应剥除自身、保留用户后续输入。
 ];
 
-function isClaudeCodeInternalPrompt(text: string): boolean {
+function isClaudeInternalPrompt(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
   return CC_INTERNAL_PROMPT_PATTERNS.some((re) => re.test(t));
@@ -88,7 +88,7 @@ export function extractUserQueryText(raw: string): string {
   // 0) CC 内部 prompt / tool_result 伪装 / 表单回执 → 整条丢弃（不写 L0）
   //    这是最高优先级：即便同时含 <user_query> 也整条判定为非人类输入。
   //    真实用户输入不会命中这些锚定在开头/整串的模式。
-  if (isClaudeCodeInternalPrompt(raw)) return "";
+  if (isClaudeInternalPrompt(raw)) return "";
 
   // 1) 优先：显式 <user_query> 块（即便同一条消息里还夹着 session-init 问答，
   //    也只取真实 query，用户输入完整保留）。

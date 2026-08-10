@@ -40,7 +40,7 @@ $EDITOR .env
    `export`+`claude` 的运行命令，形如：
 
     ```bash
-    export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude-code/default
+    export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude/default
     export ANTHROPIC_AUTH_TOKEN='sk-mem-<随机32位>'
     claude --model <PROXY_UPSTREAM_MODEL 里配的模型>
     ```
@@ -117,7 +117,7 @@ Coding agent 用记忆必须落到具体 `team / agent / task` 三元组上：
 跑 CC 时用 admin 或业务用户的 `user_key`（2.0.0 正式版起 admin 也可拥有资产）：
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude-code/default
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude/default
 export ANTHROPIC_AUTH_TOKEN="<第 1.5 步建的业务用户的 sk-mem-...>"
 claude --model <PROXY_UPSTREAM_MODEL 里配的上游模型>
 ```
@@ -241,7 +241,7 @@ docker run -d --name tdai-memory-hub \
 让 Claude Code 直接走 proxy：
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude-code/default
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude/default
 export ANTHROPIC_AUTH_TOKEN="$(cat ./.admin-key)"
 claude --model <PROXY_UPSTREAM_MODEL 里配的上游模型>
 ```
@@ -373,7 +373,7 @@ model:
 
 ## 其他平台接入（通用）
 
-除 ClaudeCode / CodeBuddy / Hermes / OpenClaw 外，任何兼容 OpenAI API 的平台或自行开发的 Agent 均可接入 Proxy，获得团队记忆能力。
+除 Claude family / CodeBuddy / Hermes / OpenClaw 外，任何兼容 OpenAI API 的平台或自行开发的 Agent 均可接入 Proxy，获得团队记忆能力。
 
 ### 接入方式
 
@@ -383,7 +383,7 @@ model:
 http://<proxy-host>:<port>/<agent-source>/<spaceId>
 ```
 
-- `<agent-source>`：平台标识，必须从 Proxy 支持的以下值中选用：`claude-code`、`codebuddy`、`hermes`、`openclaw`。如果使用的是其他平台，可伪装成其中某一个接入（如使用 `codebuddy` 作为标识）
+- `<agent-source>`：平台标识，必须从 Proxy 支持的以下值中选用：`claude`、`codebuddy`、`hermes`、`openclaw`。如果使用的是其他平台，可伪装成其中某一个接入（如使用 `codebuddy` 作为标识）
 - `<spaceId>`：memory 实例 ID（本地部署固定为 `default`）
 
 请求 Path 自动拼接 `/v1/chat/completions`（OpenAI 协议）或 `/v1/messages`（Anthropic 协议）。

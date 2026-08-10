@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 单独拉起 memory-core（内核 gateway，端口 8420），首次启动自动 init-admin +
-# 把生成的 user_key 持久化到 .admin-key 供 proxy / claude-code 使用。
+# 把生成的 user_key 持久化到 .admin-key 供 proxy / claude family 使用。
 #
 # 用法：
 #   ./start-memory-core.sh

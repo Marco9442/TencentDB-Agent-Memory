@@ -117,7 +117,7 @@ function parseQuestionAnswerXml(
  * - **Claude Code**: 用户选择在 `role: "tool"` 消息中（`multi_question_result` JSON
  *   或 `AskUserQuestion` tool_result），走 JSON 解析 + substring fallback。
  *
- * @param agentSource  "codebuddy" | "claude-code"
+ * @param agentSource  "codebuddy" | "claude"
  * @returns team_id，或 BYPASS_MARKER（用户选了"本次不关联"），或 null（未识别）
  */
 export function extractTeamFromOptionText(
@@ -324,7 +324,7 @@ function matchTask(text: string, tasks: TaskOption[]): string | undefined {
  * - **Claude Code**: 用户选择在 `role: "tool"` 消息中（`multi_question_result` JSON
  *   或 `AskUserQuestion` tool_result），走 JSON 解析 + substring fallback。
  *
- * @param agentSource  "codebuddy" | "claude-code"
+ * @param agentSource  "codebuddy" | "claude"
  * @returns `{ agent_id: BYPASS_MARKER }` 表示用户选了"本次不关联"。
  */
 export function extractFromOptionText(

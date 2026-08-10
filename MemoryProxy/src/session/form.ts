@@ -50,7 +50,7 @@ export const ASSET_CONFIRM_FORM_TITLE = "会话初始化 — 是否关联团队�
 export const MORE_LABEL = "更多 →";
 /**
  * Filler shown when the real option count on this page is 1 but Claude Code's
- * `AskUserQuestion` schema requires ≥2 options. Mirrors `claude-code/form.ts`
+ * `AskUserQuestion` schema requires ≥2 options. Mirrors `claude/form.ts`
  * — chosen deliberately to miss every team/agent/task lookup so the extractor
  * treats it as `unrecognized` and `init.ts` bypasses session-init. MUST NOT
  * contain "跳过 / 不关联 / skip" (would fire SKIP_RE on unrelated text).

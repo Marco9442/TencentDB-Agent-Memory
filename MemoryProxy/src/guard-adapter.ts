@@ -15,7 +15,10 @@
 import type { ProxyConfig } from "./types.js";
 import { log } from "./report/log.js";
 import { RedisSessionStore } from "./redis-session-store.js";
-import { matchWhitelistEndpoint } from "./routes/whitelist.js";
+import {
+  matchWhitelistEndpoint,
+  matchWhitelistUpstreamEndpoint,
+} from "./routes/whitelist.js";
 import { opikCreateTrace, opikCreateLlmSpan, uuidv7 } from "./opik.js";
 import { langfuseReportGeneration } from "./langfuse.js";
 import { writeLog } from "./logger.js";
@@ -84,7 +87,7 @@ export interface ForwardTargetRequest {
    */
   useGuard?: boolean;
   /**
-   * Agent name extracted from URL path prefix (e.g. "claude-code", "codebuddy").
+   * Agent name extracted from URL path prefix (e.g. "claude", "codebuddy").
    * Used by the cost-guard extension to look up per-agent cheap model overrides.
    * Optional — if not provided, falls back to top-level cheap config.
    */
@@ -243,13 +246,18 @@ export function joinUrl(base: string, requestPath: string): string {
     return normalizedBase;
   }
 
-  const entry = matchWhitelistEndpoint(requestPath);
+  // Handlers intentionally pass the canonical upstream suffix (for example
+  // `/messages`) after stripping the client-facing `/v1` prefix.  Resolve it
+  // through the same whitelist before falling back; otherwise every normal
+  // Anthropic/OpenAI request is incorrectly reported as `joinUrl.fallback`.
+  const entry = matchWhitelistEndpoint(requestPath) ?? matchWhitelistUpstreamEndpoint(requestPath);
   if (entry) {
     return `${normalizedBase}${entry.upstreamEndpoint}`;
   }
 
   // Fallback: 按请求路径后缀推断 Anthropic / OpenAI endpoint。
-  const endpoint = requestPath.endsWith("/messages")
+  const requestPathWithoutQuery = requestPath.split("?", 1)[0] ?? requestPath;
+  const endpoint = requestPathWithoutQuery.endsWith("/messages")
     ? "/messages"
     : "/chat/completions";
   log.warn("joinUrl.fallback", { requestPath, endpoint });

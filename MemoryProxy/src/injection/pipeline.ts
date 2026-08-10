@@ -29,7 +29,7 @@ import { NoopInjectionObserver } from "./observer.js";
 /** Optional pipeline behaviors (agent detection, etc.). */
 export interface InjectionPipelineOptions {
   /**
-   * Agent profile lookup by `agentSource` string (e.g. "codebuddy", "claude-code").
+   * Agent profile lookup by `agentSource` string (e.g. "codebuddy", "claude").
    * The URL path prefix already carries agent identity; content-based detection
    * (`detectAgent`) is kept only as a legacy fallback for paths without a prefix.
    */
@@ -177,12 +177,12 @@ export class InjectionPipeline {
     const sessionId = this.getSessionId(ctx);
     // Hook cache 隔离键 —— userId 从 metadata 里取（handler 层已透传）；
     // 缺省时 fallback 到 "anonymous"（与 handler 层一致，防止未鉴权请求撞
-    // 到已鉴权用户的缓存）。agentSource 由 URL path 派生，缺省 "claude-code"。
+    // 到已鉴权用户的缓存）。agentSource 由 URL path 或 x-client 派生，缺省 "claude"。
     // spaceId 是 P4 新增（kernel-sts）；缺省时 Repo 用 `_default` 兜底段。
     const userId = (ctx.metadata.userId && ctx.metadata.userId.length > 0)
       ? ctx.metadata.userId
       : "anonymous";
-    const agentSource = ctx.metadata.agentSource || "claude-code";
+    const agentSource = ctx.metadata.agentSource || "claude";
     const spaceId = ctx.metadata.spaceId ?? "";
     const results: HookResult[] = [];
 

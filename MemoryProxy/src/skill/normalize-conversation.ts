@@ -160,7 +160,7 @@ export function normalizeConversation(
   rawMessages: RawMessage[],
   protocol: Protocol,
   assistantMessage: RawMessage | null,
-  agentSource: string = "claude-code",
+  agentSource: string = "unknown",
 ): NormalizedMessage[] {
   const out: NormalizedMessage[] = [];
   for (const m of rawMessages) {
@@ -281,7 +281,7 @@ function convertAnthropicUser(content: unknown, agentSource: string): Normalized
   }
 
   // text 部分：通过 agentAdapter 按客户端规则提取"用户真正键入的文本"：
-  //   - claude-code: 取最后一个 text block（跳过 <system-reminder> 前缀元数据）
+  //   - claude: 取最后一个 text block（跳过 <system-reminder> 前缀元数据）
   //   - codebuddy / unknown: 走保守的"拼接所有 text"（等价改造前老逻辑）
   const adapter = resolveAgentAdapter(agentSource);
   const userText = adapter.extractUserText(content);

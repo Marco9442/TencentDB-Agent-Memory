@@ -1,5 +1,5 @@
 /**
- * Claude Code CLI 客户端适配器。
+ * Claude client-family adapter (Claude Code CLI and Claude Desktop).
  *
  * 特化实现：
  *   - classifyRequest: cache_control marker 位置 + tools/thinking 三分
@@ -14,8 +14,8 @@ import { classifyCcRequest } from "../common/cc-request-classifier.js";
 import { extractLastUserText } from "../common/user-text-extractor.js";
 import type { AgentAdapter } from "./types.js";
 
-export const claudeCodeAdapter: AgentAdapter = {
-  agentKind: "claude-code",
+export const claudeAdapter: AgentAdapter = {
+  agentKind: "claude",
   classifyRequest(body) {
     return classifyCcRequest(body);
   },

@@ -44,7 +44,7 @@ When it finishes, the script automatically:
    verified, it prints a ready-to-run block like:
 
     ```bash
-    export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude-code/default
+    export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude/default
     export ANTHROPIC_AUTH_TOKEN='sk-mem-<random 32 chars>'
     claude --model <whatever PROXY_UPSTREAM_MODEL is set to>
     ```
@@ -132,7 +132,7 @@ You'll want **at least 1 Team + 1 Agent** before you start; Task is optional.
 Use admin's or the business user's `user_key` (starting from 2.0.0 stable, admin can also own assets):
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude-code/default
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude/default
 export ANTHROPIC_AUTH_TOKEN="<the sk-mem-... from Step 1.5>"
 claude --model <whatever PROXY_UPSTREAM_MODEL is set to>
 ```
@@ -265,7 +265,7 @@ Open [http://localhost:8125](http://localhost:8125).
 `deploy/global-images/.admin-key`. Point Claude Code straight at the proxy:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude-code/default
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude/default
 export ANTHROPIC_AUTH_TOKEN="$(cat ./.admin-key)"
 claude --model <whatever PROXY_UPSTREAM_MODEL is set to>
 ```
@@ -399,7 +399,7 @@ Edit `~/.openclaw/openclaw.json`, add a provider under `models.providers`:
 
 ## Using Proxy with Other Platforms (Generic)
 
-Beyond ClaudeCode / CodeBuddy / Hermes / OpenClaw, any OpenAI-compatible platform or custom-built agent can connect to the Proxy to access team memory capabilities.
+Beyond Claude family / CodeBuddy / Hermes / OpenClaw, any OpenAI-compatible platform or custom-built agent can connect to the Proxy to access team memory capabilities.
 
 ### Connection
 
@@ -409,7 +409,7 @@ Point the platform's API base URL at the Proxy:
 http://<proxy-host>:<port>/<agent-source>/<spaceId>
 ```
 
-- `<agent-source>`: must be one of the Proxy-supported values: `claude-code`, `codebuddy`, `hermes`, `openclaw`. For other platforms, you can impersonate one of these (e.g. use `codebuddy` as the identifier)
+- `<agent-source>`: must be one of the Proxy-supported values: `claude`, `codebuddy`, `hermes`, `openclaw`. For other platforms, you can impersonate one of these (e.g. use `codebuddy` as the identifier)
 - `<spaceId>`: memory instance ID (`default` for local deployments)
 
 The request path is automatically appended: `/v1/chat/completions` (OpenAI protocol) or `/v1/messages` (Anthropic protocol).

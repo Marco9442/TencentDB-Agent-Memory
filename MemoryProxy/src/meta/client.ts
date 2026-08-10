@@ -58,6 +58,8 @@ export interface TeamEntity {
   description?: string | null;
   owner_user_id?: string;
   status?: string;
+  /** JSON metadata returned by the kernel; session-init reads fallback_agent_id. */
+  metadata_json?: string;
 }
 
 export interface AgentEntity {
@@ -69,6 +71,30 @@ export interface AgentEntity {
   prompt?: string | null;
   visibility?: string;
   status?: string;
+}
+
+/** Reserved team-wide Agent exposed in addition to a user's own Agents. */
+export const GLOBAL_AGENT_NAME = "global-agent";
+const FALLBACK_AGENT_ID_KEY = "fallback_agent_id";
+
+/**
+ * Read the team policy pointer without making malformed metadata fatal to
+ * session initialization. An absent/invalid pointer simply means that the
+ * caller sees their normal owner-scoped Agent list.
+ */
+export function getTeamFallbackAgentId(team: Pick<TeamEntity, "metadata_json">): string | undefined {
+  const raw = team.metadata_json?.trim();
+  if (!raw) return undefined;
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return undefined;
+    const value = (parsed as Record<string, unknown>)[FALLBACK_AGENT_ID_KEY];
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  } catch {
+    console.warn(`${TAG} invalid team metadata_json; ignoring fallback_agent_id`);
+    return undefined;
+  }
 }
 
 export interface TaskEntity {
@@ -121,7 +147,7 @@ export interface AppendParticipationLogInput {
   task_id: string;
   agent_id: string;
   user_id: string;
-  /** 来源标识，例：`context_proxy:claude-code`。省略则内核默认 `unknown`。 */
+  /** 来源标识，例：`context_proxy:claude`。省略则内核默认 `unknown`。 */
   source?: string;
   metadata_json?: string;
   /** ISO8601 UTC；省略则用服务端当前时间。 */
@@ -244,6 +270,50 @@ export class MetadataClient {
       body,
       LIST_PAGE_SIZE,
     );
+  }
+
+  /**
+   * List the Agents allowed in session-init: the caller's own active Agents
+   * plus the single team-designated global Agent. We intentionally fetch the
+   * global Agent by exact id instead of requesting the whole team list, so
+   * other members' ordinary/private Agents remain hidden.
+   */
+  async listSessionAgents(
+    teamId: string,
+    ownerUserId: string,
+    fallbackAgentId?: string,
+  ): Promise<AgentEntity[]> {
+    const ownAgents = await this.listAgents(teamId, ownerUserId);
+    if (!fallbackAgentId || ownAgents.some((agent) => agent.agent_id === fallbackAgentId)) {
+      return ownAgents;
+    }
+
+    try {
+      const candidate = await this.getAgent(fallbackAgentId);
+      const eligible =
+        candidate.agent_id === fallbackAgentId &&
+        candidate.team_id === teamId &&
+        candidate.name === GLOBAL_AGENT_NAME &&
+        candidate.status === "active" &&
+        candidate.visibility === "team";
+
+      if (!eligible) {
+        console.warn(
+          `${TAG} fallback Agent ${fallbackAgentId} rejected ` +
+          `(team/name/status/visibility validation failed)`,
+        );
+        return ownAgents;
+      }
+
+      return [...ownAgents, candidate];
+    } catch (err) {
+      // A stale team pointer must not make every new session fail.
+      console.warn(
+        `${TAG} fallback Agent ${fallbackAgentId} unavailable; continuing with owner-scoped Agents: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return ownAgents;
+    }
   }
 
   /** List all tasks for a team (paginated aggregation). */

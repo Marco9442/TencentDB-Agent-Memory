@@ -37,6 +37,10 @@ interface TextBlock {
 
 const CTX_OPEN = "<session_context>";
 const CTX_CLOSE = "</session_context>";
+const SESSION_BINDING_NOTICE = [
+  "当前用户选择的是 MemoryProxy 的外部记忆角色，非 Claude Code 子 Agent、后台 Agent 或消息接收者。",
+  "本会话已完成绑定。在当前对话中直接回答用户，无需转发或委派当前消息。",
+];
 
 // ── Block builder ──────────────────────────────────────────────────────────────
 
@@ -49,7 +53,7 @@ function buildContextBlock(
   const lines: string[] = [CTX_OPEN];
 
   if (agent) {
-    lines.push("[Agent]");
+    lines.push("[MemoryProxy Agent]");
     lines.push(`id: ${agent.id}`);
     if (agent.name) lines.push(`name: ${agent.name}`);
     if (agent.description) lines.push(`description: ${agent.description}`);
@@ -61,7 +65,7 @@ function buildContextBlock(
 
   if (task) {
     if (lines.length > 1) lines.push("");
-    lines.push("[Task]");
+    lines.push("[MemoryProxy Task]");
     lines.push(`id: ${task.id}`);
     if (task.name) lines.push(`name: ${task.name}`);
     if (task.description) lines.push(`description: ${task.description}`);
@@ -71,6 +75,8 @@ function buildContextBlock(
     }
   }
 
+  lines.push("");
+  lines.push(...SESSION_BINDING_NOTICE);
   lines.push(CTX_CLOSE);
   return lines.join("\n");
 }

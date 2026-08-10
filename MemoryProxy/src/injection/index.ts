@@ -86,7 +86,7 @@ export { detectUnknownTags, classifyTags } from "./agents/codebuddy/constants.js
 export { CodeBuddyProfile } from "./agents/codebuddy/profile.js";
 
 // Claude Code
-export { ClaudeCodeProfile } from "./agents/claude-code/index.js";
+export { ClaudeProfile } from "./agents/claude/index.js";
 
 // ── Pipeline Factory ──────────────────────────────────────────────────────────
 
@@ -105,7 +105,7 @@ import { AssetReflectionInjector } from "./injectors/asset-reflection-injector.j
 import type { ProtocolAdapter } from "./adapters/interface.js";
 import type { AgentProfile } from "./agents/interface.js";
 import { CodeBuddyProfile } from "./agents/codebuddy/profile.js";
-import { ClaudeCodeProfile } from "./agents/claude-code/index.js";
+import { ClaudeProfile } from "./agents/claude/index.js";
 import { getHookCacheRepo, setHookCacheRepo, type HookCacheRepo } from "../db/hookCacheRepo.js";
 import { getSessionRepo, setSessionRepo, type SessionRepo } from "../db/sessionRepo.js";
 import { getRedisClient } from "../db/redis-client.js";
@@ -359,14 +359,14 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
     // (content-scanning) is kept as fallback for un-prefixed paths.
     agentProfiles: new Map<string, AgentProfile>([
       ["codebuddy", new CodeBuddyProfile()],
-      ["claude-code", new ClaudeCodeProfile()],
+      ["claude", new ClaudeProfile()],
       // ["cursor", new CursorProfile()],
     ]),
     // Legacy fallback: scan system prompt content (for backward compat).
     detectAgent: (() => {
       const agentProfiles: AgentProfile[] = [
         new CodeBuddyProfile(),
-        new ClaudeCodeProfile(),
+        new ClaudeProfile(),
       ];
       return (systemText: string) =>
         agentProfiles.find((p) => p.detect(systemText)) ?? null;
