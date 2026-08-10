@@ -37,7 +37,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/marco9442/tencentdb-agent-memory-core
+          images: ghcr.io/marco9442/memory-core
           tags: |
             type=raw,value=latest
             type=sha,prefix=sha-
@@ -87,7 +87,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/marco9442/tencentdb-agent-memory-hub
+          images: ghcr.io/marco9442/memory-hub
           tags: |
             type=raw,value=latest
             type=sha,prefix=sha-

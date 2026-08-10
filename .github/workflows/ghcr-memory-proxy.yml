@@ -12,7 +12,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/marco9442/tencentdb-agent-memory-proxy
+  IMAGE_NAME: ghcr.io/marco9442/memory-proxy
 
 jobs:
   build-and-publish:
