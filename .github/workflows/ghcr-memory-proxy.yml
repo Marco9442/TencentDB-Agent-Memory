@@ -3,7 +3,7 @@ name: Build and publish MemoryProxy image
 on:
   push:
     branches:
-      - main
+      - feature/openai-responses
   workflow_dispatch:
 
 permissions:
