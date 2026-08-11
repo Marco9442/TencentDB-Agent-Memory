@@ -6,6 +6,7 @@ import {
   recordTdaiTurn,
 } from "./recorder.js";
 import { extractLastUserText } from "../common/user-text-extractor.js";
+import { claudeAdapter } from "../agent-adapters/claude.js";
 import type { TdaiIdentity, TdaiMessage } from "./types.js";
 
 const identity: TdaiIdentity = {
@@ -43,6 +44,35 @@ describe("TDAI L0 recorder", () => {
     ]);
     expect(addConversation.mock.calls[2]?.[1]).toEqual([
       { role: "assistant", content: "下一步" },
+    ]);
+  });
+
+  it("does not let a Claude internal prompt claim the turn before the real user message", async () => {
+    const internalPrompt = "[SUGGESTION MODE: suggest what the user might type next]";
+    expect(claudeAdapter.extractUserText(internalPrompt)).toBeNull();
+    expect(claudeAdapter.extractUserText("做一次只读校验")).toBe("做一次只读校验");
+
+    const addConversation = vi.fn(
+      async (_identity: TdaiIdentity, _messages: TdaiMessage[]) => undefined,
+    );
+    const client = { addConversation } as unknown as TdaiClient;
+
+    const internalUser = extractLatestUserMessage(
+      [{ role: "user", content: internalPrompt }],
+      (content) => claudeAdapter.extractUserText(content),
+    );
+    await recordTdaiTurn(client, identity, internalUser, "synthetic reply", { turnSeq: 13 });
+
+    const realUser = extractLatestUserMessage(
+      [{ role: "user", content: "做一次只读校验" }],
+      (content) => claudeAdapter.extractUserText(content),
+    );
+    await recordTdaiTurn(client, identity, realUser, "真实回复", { turnSeq: 13 });
+
+    expect(addConversation).toHaveBeenCalledTimes(1);
+    expect(addConversation.mock.calls[0]?.[1]).toEqual([
+      { role: "user", content: "做一次只读校验" },
+      { role: "assistant", content: "真实回复" },
     ]);
   });
 

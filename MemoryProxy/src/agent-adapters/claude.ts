@@ -12,6 +12,7 @@
 
 import { classifyCcRequest } from "../common/cc-request-classifier.js";
 import { extractLastUserText } from "../common/user-text-extractor.js";
+import { extractUserQueryText } from "../common/user-query-extractor.js";
 import type { AgentAdapter } from "./types.js";
 
 export const claudeAdapter: AgentAdapter = {
@@ -20,6 +21,9 @@ export const claudeAdapter: AgentAdapter = {
     return classifyCcRequest(body);
   },
   extractUserText(content) {
-    return extractLastUserText(content);
+    const raw = extractLastUserText(content);
+    if (raw == null) return null;
+    const text = extractUserQueryText(raw).trim();
+    return text || null;
   },
 };

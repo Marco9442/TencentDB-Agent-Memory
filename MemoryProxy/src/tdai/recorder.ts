@@ -90,7 +90,14 @@ export async function recordTdaiTurn(
   if (!identity) return;
 
   const turnKey = makeTurnKey(identity, options.turnSeq);
-  const includeUser = Boolean(userMessage) && (!turnKey || !recordedUserTurns.has(turnKey));
+  const hasRecordedUser = Boolean(turnKey && recordedUserTurns.has(turnKey));
+  const includeUser = Boolean(userMessage) && !hasRecordedUser;
+  // An internal Claude prompt can arrive before the real user message while
+  // sharing the same turn sequence. Do not retain its assistant-only result
+  // or claim the deduplication key; the real user request must be first.
+  // Keep the legacy no-turnSeq behavior unchanged for callers that do not
+  // participate in agentic-turn deduplication.
+  if (turnKey && !includeUser && !hasRecordedUser) return;
   const messages: TdaiMessage[] = [];
   if (includeUser && userMessage) messages.push(userMessage);
   const assistant = sanitizeTdaiAssistantContent(assistantContent);
