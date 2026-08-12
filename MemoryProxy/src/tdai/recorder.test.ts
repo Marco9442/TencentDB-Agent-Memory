@@ -48,7 +48,7 @@ describe("TDAI L0 recorder", () => {
   });
 
   it("does not let a Claude internal prompt claim the turn before the real user message", async () => {
-    const internalPrompt = "[SUGGESTION MODE: suggest what the user might type next]";
+    const internalPrompt = "Err on the side of blocking. Stage 1 does NOT apply user intent or ALLOW exceptions — stage 2 will handle those.";
     expect(claudeAdapter.extractUserText(internalPrompt)).toBeNull();
     expect(claudeAdapter.extractUserText("做一次只读校验")).toBe("做一次只读校验");
 
@@ -73,6 +73,42 @@ describe("TDAI L0 recorder", () => {
     expect(addConversation.mock.calls[0]?.[1]).toEqual([
       { role: "user", content: "做一次只读校验" },
       { role: "assistant", content: "真实回复" },
+    ]);
+  });
+
+  it("keeps two different user messages when derived turnSeq collides", async () => {
+    const addConversation = vi.fn(
+      async (_identity: TdaiIdentity, _messages: TdaiMessage[]) => undefined,
+    );
+    const client = { addConversation } as unknown as TdaiClient;
+
+    await recordTdaiTurn(client, identity, { role: "user", content: "第一条问题" }, "第一条回复", { turnSeq: 16 });
+    await recordTdaiTurn(client, identity, { role: "user", content: "第二条问题" }, "第二条回复", { turnSeq: 16 });
+
+    expect(addConversation.mock.calls.map((call) => call[1])).toEqual([
+      [
+        { role: "user", content: "第一条问题" },
+        { role: "assistant", content: "第一条回复" },
+      ],
+      [
+        { role: "user", content: "第二条问题" },
+        { role: "assistant", content: "第二条回复" },
+      ],
+    ]);
+  });
+
+  it("allows a pure tool_result continuation after the user was recorded", async () => {
+    const addConversation = vi.fn(
+      async (_identity: TdaiIdentity, _messages: TdaiMessage[]) => undefined,
+    );
+    const client = { addConversation } as unknown as TdaiClient;
+
+    await recordTdaiTurn(client, identity, { role: "user", content: "需要调用工具" }, "调用工具", { turnSeq: 17 });
+    await recordTdaiTurn(client, identity, null, "工具结果后的回复", { turnSeq: 17 });
+
+    expect(addConversation).toHaveBeenCalledTimes(2);
+    expect(addConversation.mock.calls[1]?.[1]).toEqual([
+      { role: "assistant", content: "工具结果后的回复" },
     ]);
   });
 

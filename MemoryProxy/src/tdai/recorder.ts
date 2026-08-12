@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { TdaiClient } from "./client.js";
 import type { TdaiIdentity, TdaiMessage } from "./types.js";
 import { extractUserQueryText } from "../common/user-query-extractor.js";
@@ -60,7 +61,7 @@ export function __resetTdaiRecorderStateForTests(): void {
   recordedUserTurns.clear();
 }
 
-function makeTurnKey(identity: TdaiIdentity, turnSeq: number | undefined): string | null {
+function makeTurnBaseKey(identity: TdaiIdentity, turnSeq: number | undefined): string | null {
   if (!turnSeq || turnSeq <= 0) return null;
   return JSON.stringify([
     identity.teamId,
@@ -70,6 +71,25 @@ function makeTurnKey(identity: TdaiIdentity, turnSeq: number | undefined): strin
     identity.taskId ?? "",
     turnSeq,
   ]);
+}
+
+function makeTurnKey(
+  identity: TdaiIdentity,
+  turnSeq: number | undefined,
+  userContent: string | undefined,
+): string | null {
+  const baseKey = makeTurnBaseKey(identity, turnSeq);
+  if (!baseKey || !userContent) return baseKey;
+  const contentHash = createHash("sha256").update(userContent).digest("hex");
+  return `${baseKey}:${contentHash}`;
+}
+
+function hasRecordedUserForTurn(baseKey: string | null): boolean {
+  if (!baseKey) return false;
+  for (const key of recordedUserTurns) {
+    if (key === baseKey || key.startsWith(`${baseKey}:`)) return true;
+  }
+  return false;
 }
 
 function rememberUserTurn(key: string): void {
@@ -89,8 +109,15 @@ export async function recordTdaiTurn(
 ): Promise<void> {
   if (!identity) return;
 
-  const turnKey = makeTurnKey(identity, options.turnSeq);
-  const hasRecordedUser = Boolean(turnKey && recordedUserTurns.has(turnKey));
+  const turnBaseKey = makeTurnBaseKey(identity, options.turnSeq);
+  const turnKey = makeTurnKey(identity, options.turnSeq, userMessage?.content);
+  // With a user message, compare its content-specific key so two real prompts
+  // that share a derived turnSeq are both retained.  Without one (normally a
+  // pure tool_result continuation), only the turn base is available and any
+  // prior user hash authorizes the assistant-only append.
+  const hasRecordedUser = userMessage
+    ? Boolean(turnKey && recordedUserTurns.has(turnKey))
+    : hasRecordedUserForTurn(turnBaseKey);
   const includeUser = Boolean(userMessage) && !hasRecordedUser;
   // An internal Claude prompt can arrive before the real user message while
   // sharing the same turn sequence. Do not retain its assistant-only result

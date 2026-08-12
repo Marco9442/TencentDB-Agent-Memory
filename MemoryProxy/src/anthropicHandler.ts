@@ -56,12 +56,6 @@ import {
 } from "./rate-limit/guard.js";
 import { composeUpstreamSignal } from "./common/upstream-signal.js";
 import { resolveAgentSourceFromClient } from "./client-identity.js";
-import { getProxyStorage } from "./storage/factory.js";
-import {
-  AnthropicRoundStore,
-  isAnthropicTerminalStopReason,
-  type AnthropicRoundState,
-} from "./anthropic/round-store.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -571,11 +565,8 @@ export async function handleAnthropicMessages(
   //   - claude: 按 cache_control marker + tools/thinking 三分
   //   - codebuddy / unknown: 恒 main（未适配，等价现状）
   //
-  // memory eligibility is always classified for adapters that provide a
-  // structural signal (notably Claude). `ccRequestRouting` only controls the
-  // legacy session/injection routing behaviour below. Keeping these two
-  // decisions separate prevents a fork/sidequery from becoming a main L0
-  // turn merely because routing was disabled.
+  // 关闭 ccRequestRouting.enabled 时强制视为 main，走完全等价现状的老链路。
+  // 详见 docs/design/2026-07-30-cc-request-routing-plan.md
   const _pathPartsEarly = c.req.path.split("/").filter(Boolean);
   const _agentFromPathEarly = _pathPartsEarly[0]
     && !["v1", "proxy", "skill-bridge", "memory-bridge"].includes(_pathPartsEarly[0])
@@ -586,8 +577,7 @@ export async function handleAnthropicMessages(
   );
   const agentAdapter = resolveAgentAdapter(earlyAgentSource);
   const ccRoutingEnabled = config.ccRequestRouting?.enabled === true;
-  const requestKind: CcRequestKind = agentAdapter.classifyRequest(body);
-  const routingRequestKind: CcRequestKind = ccRoutingEnabled ? requestKind : "main";
+  const requestKind: CcRequestKind = ccRoutingEnabled ? agentAdapter.classifyRequest(body) : "main";
 
   // ── Model gate: reject requests whose `model` is not a registered display name ──
   // 价目表已配置时，客户端 `model` 必须匹配某条 entry 的 `modelName`（展示名，
@@ -702,7 +692,7 @@ export async function handleAnthropicMessages(
   // CC 分流：SIDEQUERY 完全跳过 session-init（独立小请求无对话概念）。
   //          FORK 允许走 L2b recovery 复用 MAIN 已建的 session，但不进 form 交互路径
   //          （借用 MAIN 的 sessionInfo，见下方的 kind === 'fork' 分支保护）。
-  const skipSessionInit = routingRequestKind === "sidequery";
+  const skipSessionInit = requestKind === "sidequery";
   if (config.sessionInit?.enabled && conversationId && !skipSessionInit) {
     try {
       const { getSessionStore, handleSessionInit, parsePresetIdentity } = await import("./session/index.js");
@@ -771,7 +761,7 @@ export async function handleAnthropicMessages(
           bypassed: recovered.bypassed,
           justRegistered: true, // triggers prewarm to refill hook cache
         };
-      } else if (routingRequestKind === "fork") {
+      } else if (requestKind === "fork") {
         // FORK 借用 MAIN 已建的 session。L2b 未命中说明 MAIN 尚未完成 init —— 罕见情况，
         // 保守起见让 fork 请求走 no-op（不 intercept、不改 messages），让上游收到原样请求。
         // 这样最坏结果 = MAIN 那次拿不到 sessionInfo（等效关掉 session-init），不会更糟。
@@ -1011,68 +1001,12 @@ export async function handleAnthropicMessages(
     (content) => agentAdapter.extractUserText(content),
   );
 
-  // ── Anthropic round lifecycle ──────────────────────────────────────────
-  // A Claude tool loop is several HTTP requests but one human round. Allocate
-  // a random, durable round id from the first structured main request and
-  // reuse it for tool_result continuations/replays. The request event key is
-  // only a replay detector; identical questions after a completed round still
-  // get a fresh round id.
-  let anthropicRoundStore: AnthropicRoundStore | null = null;
-  let anthropicRound: AnthropicRoundState | null = null;
-  if (requestKind === "main" && sessionKey) {
-    const roundScope = JSON.stringify([
-      spaceId || "_default",
-      tdaiIdentity?.teamId || String(sessionInfo?.team_id ?? ""),
-      tdaiIdentity?.userId || String(sessionInfo?.user_id ?? (userId || keyId)),
-      tdaiIdentity?.agentId || String(sessionInfo?.agent_id ?? ""),
-      tdaiIdentity?.taskId || String(sessionInfo?.task_id ?? ""),
-      agentSource,
-      sessionKey,
-    ]);
-    try {
-      let roundStorage: ReturnType<typeof getProxyStorage> | null = null;
-      try {
-        roundStorage = getProxyStorage(config.storage);
-      } catch (storageError) {
-        // COS/bootstrap failures must not disable the lifecycle entirely. Keep
-        // a process-local round store so a tool loop is still aggregated and
-        // deduplicated within this worker while the durable backend recovers.
-        console.warn(
-          "[anthropic-round] durable storage unavailable; using process-local fallback:",
-          storageError instanceof Error ? storageError.message : String(storageError),
-        );
-      }
-      anthropicRoundStore = new AnthropicRoundStore(roundStorage, roundScope);
-      const begun = await anthropicRoundStore.beginRequest(
-        {
-          messages,
-          extractUserText: (content) => agentAdapter.extractUserText(content),
-          // Only an explicit idempotency key is treated as a native request
-          // identity. Generic x-request-id headers are often per HTTP attempt
-          // and would split one Claude tool loop into multiple rounds.
-          requestId: c.req.header("idempotency-key") ?? undefined,
-        },
-        {
-          spaceId: spaceId || "_default",
-          userId: userId || keyId || "anonymous",
-          agentSource,
-          sessionKey,
-        },
-      );
-      anthropicRound = begun.state;
-    } catch (err) {
-      // Storage is an optional enhancement. A missing backend leaves the
-      // existing process-local recorder path available below.
-      console.warn("[anthropic-round] lifecycle unavailable:", err instanceof Error ? err.message : String(err));
-    }
-  }
-
   // ── Context injection (before cost guard) ────────────────────────────────
   // CC 分流：
   //   - SIDEQUERY: 完全跳过 injection（自带短 prompt，不共享 cache）
   //   - FORK: 走 pipeline 但 readOnly=true（miss 时不 self-heal 写 cache，避免破坏主对话 cache）
   //   - MAIN: 走完整 pipeline（含 self-heal）
-  const skipInjection = routingRequestKind === "sidequery";
+  const skipInjection = requestKind === "sidequery";
   if (!injectedSkipped && !skipInjection && config.injection?.enabled && config.injection.injectors.length > 0) {
     try {
       console.log(`[injection-debug] entering injection pipeline session=${sessionKey} turnSeq=${countHumanTurns(messages, "anthropic")} injectors=${config.injection.injectors} kind=${requestKind}`);
@@ -1094,7 +1028,7 @@ export async function handleAnthropicMessages(
         // 其它 injector 不依赖此字段。
         requestPath: c.req.path,
         custom: sessionInfo ? { session: sessionInfo, userKey: callerUserKey ?? undefined, assetCapabilities } : undefined,
-        readOnly: routingRequestKind === "fork",
+        readOnly: requestKind === "fork",
       });
       body = injectedBody;
       messages = Array.isArray(injectedBody.messages) ? injectedBody.messages : messages;
@@ -1379,8 +1313,6 @@ export async function handleAnthropicMessages(
       upstreamStatus: upstreamResp.status,
       langfuseDebug,
       debugMetadata,
-      roundStore: anthropicRoundStore,
-      roundState: anthropicRound,
     });
 
     const clientStream = rawClientStream.pipeThrough(createSseThinkingFixStream(pipe));
@@ -1530,33 +1462,11 @@ export async function handleAnthropicMessages(
   // CC 分流：FORK/SIDEQUERY 是 CC 客户端后台自发调用，不是用户真实对话轮，
   //          跳过 skill/L0 副作用。Credit 仍上报（token 消耗真实）。
   const isMainDialog = requestKind === "main";
-  const roundLifecycleEnabled = Boolean(anthropicRoundStore && anthropicRound);
-  if (roundLifecycleEnabled) {
-    await finalizeAnthropicRound({
-      config,
-      roundStore: anthropicRoundStore,
-      roundState: anthropicRound,
-      tdaiClient,
-      tdaiIdentity,
-      assistantMessage,
-      assistantText: outputContent,
-      responseId: upstreamResponseId,
-      inputMessages: messages,
-      toolUseIds: anthropicToolUseIds(assistantMessage),
-      toolResultIds: anthropicToolResultIds(messages),
-      final: upstreamSuccess && isAnthropicTerminalStopReason(stopReason),
-      upstreamSuccess,
-      sessionKey,
-      agentSource,
-      sessionInfo,
-      assetCapabilities,
-      pipe,
-    });
-  }
+  const memoryInputAllowed = shouldRecordAnthropicMemory(tdaiUserMessage, messages);
 
   // Skill extract trigger — count tool_use blocks + buffer conversation.
   // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-  if (!roundLifecycleEnabled && isMainDialog && upstreamSuccess && isExtractionAllowed(config, "skill")) {
+  if (isMainDialog && memoryInputAllowed && upstreamSuccess && isExtractionAllowed(config, "skill")) {
     await triggerSkillExtractIfReady({
       config,
       sessionKey,
@@ -1567,7 +1477,7 @@ export async function handleAnthropicMessages(
       protocol: "anthropic",
       assetCapabilities,
     });
-  } else if (!roundLifecycleEnabled && isMainDialog) {
+  } else if (isMainDialog) {
     logExtractionSkipped(config, "skill", sessionKey);
   } else {
     console.log(`[cc-routing] skip skill buffer for kind=${requestKind} session=${sessionKey}`);
@@ -1579,10 +1489,10 @@ export async function handleAnthropicMessages(
   // 短期记忆。**此前仅 stream=true 会写**，non-stream 请求（如工具/测试脚本
   // 常用的 stream:false）沉默丢失。缺失该调用意味着 CC non-stream 场景
   // 完全没有 L0 记忆写入。
-  if (!roundLifecycleEnabled && isMainDialog && upstreamSuccess && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
+  if (isMainDialog && memoryInputAllowed && upstreamSuccess && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
     recordTdaiTurn(tdaiClient, tdaiIdentity, tdaiUserMessage, outputContent, { turnSeq: lf.turnSeq })
       .catch((err: unknown) => pipe.error("TDAI_L0", err));
-  } else if (!roundLifecycleEnabled && isMainDialog && tdaiClient) {
+  } else if (isMainDialog && tdaiClient) {
     logExtractionSkipped(config, "tdai-memory", sessionKey);
   } else if (!isMainDialog) {
     console.log(`[cc-routing] skip L0 write for kind=${requestKind} session=${sessionKey}`);
@@ -1768,113 +1678,28 @@ interface AnthropicTapContext {
   langfuseDebug: boolean;
   /** buildRequestDebugMetadata 求值结果；debug=false 时为 {}。 */
   debugMetadata: Record<string, unknown>;
-  /** Durable open-round state. Null means the optional lifecycle is unavailable. */
-  roundStore?: AnthropicRoundStore | null;
-  roundState?: AnthropicRoundState | null;
 }
 
-function anthropicToolUseIds(message: Record<string, unknown> | null | undefined): string[] {
-  const content = message?.content;
-  if (!Array.isArray(content)) return [];
-  return content.flatMap((block) => {
-    const b = block as Record<string, unknown>;
-    return b?.type === "tool_use" && typeof b.id === "string" ? [b.id] : [];
-  });
-}
-
-function anthropicToolResultIds(messages: unknown[]): string[] {
-  const out: string[] = [];
-  for (const message of messages) {
-    const m = message as Record<string, unknown>;
-    if (m?.role !== "user" || !Array.isArray(m.content)) continue;
-    for (const block of m.content) {
-      const b = block as Record<string, unknown>;
-      if (b?.type === "tool_result" && typeof b.tool_use_id === "string") out.push(b.tool_use_id);
-    }
-  }
-  return [...new Set(out)];
-}
-
-async function finalizeAnthropicRound(args: {
-  config: ProxyConfig;
-  roundStore?: AnthropicRoundStore | null;
-  roundState?: AnthropicRoundState | null;
-  tdaiClient: TdaiClient | null;
-  tdaiIdentity: TdaiIdentity | null;
-  assistantMessage: Record<string, unknown> | null;
-  assistantText: string | null;
-  responseId?: string;
-  inputMessages: unknown[];
-  toolUseIds: string[];
-  toolResultIds: string[];
-  final: boolean;
-  upstreamSuccess: boolean;
-  sessionKey: string;
-  agentSource: string;
-  sessionInfo: Record<string, unknown> | null | undefined;
-  assetCapabilities?: import("./injection/types.js").AssetCapabilityFlags;
-  pipe?: ReturnType<typeof createPipeline>;
-}): Promise<void> {
-  if (!args.upstreamSuccess || !args.roundState || !args.roundStore) return;
-  const state = await args.roundStore.recordResponse(args.roundState.roundId, {
-    inputMessages: args.inputMessages,
-    assistantMessage: args.assistantMessage,
-    assistantText: args.assistantText,
-    toolUseIds: args.toolUseIds,
-    toolResultIds: args.toolResultIds,
-    final: args.final,
-    responseId: args.responseId,
-  });
-  if (!state || !args.final || state.pendingToolUseIds.length > 0) return;
-
-  const userContent = state.originalUserInput.trim();
-  const assistantContent = args.assistantText?.trim() ?? "";
-  if (args.tdaiClient && args.tdaiIdentity && userContent && assistantContent
-      && isExtractionAllowed(args.config, "tdai-memory")) {
-    const claimed = await args.roundStore.beginOnce(state.roundId, "l0").catch(() => false);
-    if (claimed) {
-      try {
-        await withL0Retry(() => args.tdaiClient!.addConversationStrict(
-          args.tdaiIdentity!,
-          [
-            { role: "user", content: userContent },
-            { role: "assistant", content: assistantContent },
-          ],
-          { idempotencyKey: `anthropic:${state.roundId}` },
-        ));
-        if (!await args.roundStore.completeOnce(state.roundId, "l0")) {
-          await args.roundStore.releaseOnce(state.roundId, "l0");
-        }
-      } catch (error) {
-        await args.roundStore.releaseOnce(state.roundId, "l0").catch(() => undefined);
-        args.pipe?.error("TDAI_L0", error);
-      }
-    }
-  }
-
-  if (isExtractionAllowed(args.config, "skill")) {
-    const claimed = await args.roundStore.beginOnce(state.roundId, "skill").catch(() => false);
-    if (claimed) {
-      try {
-        await triggerSkillExtractIfReady({
-          config: args.config,
-          sessionKey: args.sessionKey,
-          agentSource: args.agentSource,
-          sessionInfo: args.sessionInfo,
-          inputMessages: state.conversationMessages,
-          assistantMessage: args.assistantMessage ?? (assistantContent ? { role: "assistant", content: assistantContent } : null),
-          protocol: "anthropic",
-          assetCapabilities: args.assetCapabilities,
-        });
-        if (!await args.roundStore.completeOnce(state.roundId, "skill")) {
-          await args.roundStore.releaseOnce(state.roundId, "skill");
-        }
-      } catch (error) {
-        await args.roundStore.releaseOnce(state.roundId, "skill").catch(() => undefined);
-        args.pipe?.error("SKILL", error);
-      }
-    }
-  }
+/**
+ * A Claude request without an extracted human message is normally an internal
+ * prompt (recap/suggestion/policy check).  The one legitimate exception is a
+ * tool_result continuation: its user message contains no human text but must
+ * still retain the assistant/tool-loop record.  Keep this gate at the handler
+ * boundary so an already-seen turn cannot turn an internal assistant reply
+ * into an assistant-only L0 record.
+ */
+export function shouldRecordAnthropicMemory(
+  userMessage: TdaiMessage | null,
+  messages: unknown[],
+): boolean {
+  if (userMessage) return true;
+  const latestUser = [...messages].reverse().find((message) => (
+    (message as Record<string, unknown>)?.role === "user"
+  )) as Record<string, unknown> | undefined;
+  if (!latestUser || !Array.isArray(latestUser.content)) return false;
+  return latestUser.content.some((block) => (
+    (block as Record<string, unknown>)?.type === "tool_result"
+  ));
 }
 
 /**
@@ -2010,32 +1835,10 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
         && ctx.upstreamStatus < 300
         && !streamFailed;
 
-      const roundLifecycleEnabled = Boolean(ctx.roundStore && ctx.roundState);
-      if (roundLifecycleEnabled) {
-        await finalizeAnthropicRound({
-          config: ctx.config,
-          roundStore: ctx.roundStore,
-          roundState: ctx.roundState,
-          tdaiClient: ctx.tdaiClient,
-          tdaiIdentity: ctx.tdaiIdentity,
-          assistantMessage: outputText ? { role: "assistant", content: outputText } : null,
-          assistantText: outputText || null,
-          responseId: streamResponseId,
-          inputMessages: ctx.inputMessages,
-          toolUseIds,
-          toolResultIds: anthropicToolResultIds(ctx.inputMessages),
-          final: memorySideEffectsAllowed && messageStopped && isAnthropicTerminalStopReason(stopReason),
-          upstreamSuccess: memorySideEffectsAllowed,
-          sessionKey: ctx.sessionKeyForSkill,
-          agentSource: ctx.agentSource,
-          sessionInfo: ctx.sessionInfo,
-          assetCapabilities: ctx.assetCapabilities,
-          pipe,
-        });
-      }
+      const memoryInputAllowed = shouldRecordAnthropicMemory(ctx.tdaiUserMessage, ctx.inputMessages);
 
       // Tdai L0 write
-      if (!roundLifecycleEnabled && isMainDialog && memorySideEffectsAllowed && ctx.tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
+      if (isMainDialog && memoryInputAllowed && memorySideEffectsAllowed && ctx.tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
         // Streaming 不 await（会拖慢 SSE 关流），trackWrite + withL0Retry 应对两条丢包线：
         //   - trackWrite 注册 in-flight promise 到全局 set；SIGTERM 时 index.ts 会
         //     flushPendingWrites 兜底，避免 pod rolling 时 event loop 未 flush 就退出丢 L0。
@@ -2047,7 +1850,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
             { turnSeq: lf.turnSeq },
           )).catch((err: unknown) => pipe.error("TDAI_L0", err))
         );
-      } else if (!roundLifecycleEnabled && isMainDialog && ctx.tdaiClient) {
+      } else if (isMainDialog && ctx.tdaiClient) {
         logExtractionSkipped(ctx.config, "tdai-memory", ctx.sessionKeyForSkill);
       } else if (!isMainDialog) {
         console.log(`[cc-routing] skip L0 write (stream) for kind=${ctx.requestKind} session=${ctx.sessionKeyForSkill}`);
@@ -2057,7 +1860,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
 
       // Skill extract trigger — after stream finalization.
       // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-      if (!roundLifecycleEnabled && isMainDialog && memorySideEffectsAllowed && isExtractionAllowed(ctx.config, "skill")) {
+      if (isMainDialog && memoryInputAllowed && memorySideEffectsAllowed && isExtractionAllowed(ctx.config, "skill")) {
         await triggerSkillExtractIfReady({
           config: ctx.config,
           sessionKey: ctx.sessionKeyForSkill,
@@ -2071,7 +1874,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
           assetCapabilities: ctx.assetCapabilities,
           toolCallCountOverride: toolUseCount,
         });
-      } else if (!roundLifecycleEnabled && isMainDialog) {
+      } else if (isMainDialog) {
         logExtractionSkipped(ctx.config, "skill", ctx.sessionKeyForSkill);
       } else {
         console.log(`[cc-routing] skip skill buffer (stream) for kind=${ctx.requestKind} session=${ctx.sessionKeyForSkill}`);

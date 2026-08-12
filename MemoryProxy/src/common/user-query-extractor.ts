@@ -58,6 +58,15 @@ const CC_INTERNAL_PROMPT_PATTERNS: RegExp[] = [
   /^\s*\[(?:SUGGESTION|TITLE|SUMMARY|COMPACT|COMPACTION|ANALYSIS|EVAL|RECAP|MEMORY|SIDECHAIN)\s+MODE[:\s]/i,
   // CC 会话恢复 prompt（在 core prompts/session-resume 里定义）
   /^\s*The user stepped away and is coming back\.\s*Recap/i,
+  // Claude Code 的内部安全分类请求。它使用 role=user 承载固定 policy
+  // prompt，不能进入 L0/Skill；锚定完整开头，避免误伤用户讨论该短语的消息。
+  /^\s*Err on the side of blocking\.\s*Stage 1 does NOT apply user intent or ALLOW exceptions\b/i,
+  // Claude Code 转录/本地命令工件。以下形状均来自实际 L0 噪音样本；只匹配
+  // 明确的开头或完整结构，不匹配正文中对这些词的普通讨论。
+  /^\s*<local-command-caveat(?:\s|>)/i,
+  /^\s*<transcript(?:\s|>)/i,
+  /^\s*offset\s+\d+\s+[\u3400-\u9fff]/i,
+  /^\s*setData\(\s+\d+\s+setDataLegacy\b/,
   // AskUserQuestion 回执（session-init 或运行时问答）
   /^\s*Your questions have been answered:\s*"/i,
   // CC 结构化 promptId 元数据 JSON（首字符是数字 + JSON 或直接 JSON 元信息）
