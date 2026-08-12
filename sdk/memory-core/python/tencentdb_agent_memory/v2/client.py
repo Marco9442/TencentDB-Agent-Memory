@@ -112,15 +112,17 @@ class MemoryClient:
         agent_id: Optional[str] = None,
         user_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /conversation/add``"""
         return self._stub.post(
             f"{_V2}/conversation/add",
-            {
+            _strip_none({
                 **_id_fields(team_id, agent_id, user_id, task_id),
                 "session_id": session_id,
+                "idempotency_key": idempotency_key,
                 "messages": messages,
-            },
+            }),
         )
 
     def query_conversation(
@@ -598,11 +600,13 @@ class AsyncMemoryClient:
         *,
         team_id: Optional[str] = None, agent_id: Optional[str] = None,
         user_id: Optional[str] = None, task_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         return await self._stub.post(
             f"{_V2}/conversation/add",
-            {**_id_fields(team_id, agent_id, user_id, task_id),
-             "session_id": session_id, "messages": messages},
+            _strip_none({**_id_fields(team_id, agent_id, user_id, task_id),
+             "session_id": session_id, "idempotency_key": idempotency_key,
+             "messages": messages}),
         )
 
     async def query_conversation(

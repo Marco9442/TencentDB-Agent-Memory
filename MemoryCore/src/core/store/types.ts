@@ -577,6 +577,8 @@ export interface IMemoryStore {
 
   // ── L0 Read ──────────────────────────────────────────────
 
+  /** Primary-key lookup used by the conversation idempotency preflight. */
+  getL0RecordsByIds(recordIds: string[]): MaybePromise<L0QueryRow[] | null>;
   countL0(filter?: L0CountFilter): MaybePromise<number>;
   queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit?: number): MaybePromise<L0QueryRow[]>;
   queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit?: number): MaybePromise<L0SessionGroup[]>;

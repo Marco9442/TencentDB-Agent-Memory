@@ -1757,6 +1757,29 @@ export class VectorStore implements IMemoryStore {
 
   // ── L0 operations ──────────────────────────────────
 
+  getL0RecordsByIds(recordIds: string[]): L0QueryRow[] {
+    if (this.degraded || recordIds.length === 0) return [];
+    const rows: L0QueryRow[] = [];
+    for (const recordId of [...new Set(recordIds)]) {
+      const meta = this.stmtL0GetMeta.get(recordId) as
+        | {
+            session_key: string;
+            session_id: string;
+            team_id: string;
+            task_id: string;
+            user_id: string;
+            agent_id: string;
+            role: string;
+            message_text: string;
+            recorded_at: string;
+            timestamp: number;
+          }
+        | undefined;
+      if (meta) rows.push({ record_id: recordId, ...meta });
+    }
+    return rows;
+  }
+
   /**
    * Write or update an L0 single-message record (metadata + vector).
    * Uses a manual transaction for atomicity.

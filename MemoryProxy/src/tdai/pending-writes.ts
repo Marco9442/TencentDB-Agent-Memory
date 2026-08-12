@@ -18,10 +18,9 @@
  *   - `recordTdaiTurn(client, identity=null | userMessage=null)` 时 client 侧直接
  *     return，本模块不介入。
  *
- * 重复写风险：如果第一次 POST 已到达 tdai kernel 但客户端读 5xx 超时后重试，
- * kernel 可能收到两条同样内容的 L0（tdai `/v3/conversation/add` 目前没有
- * idempotency-key）。可接受：宁可重复也不要丢；且重试的两次 POST payload 完全
- * 一致，L1/L2/L3 蒸馏管线幂等（同一 hash 一条），观测上仅 L0 冗余。
+ * 最终 round 生命周期会为 `/v3/conversation/add` 传递稳定
+ * `idempotency_key`，因此超时后的同 round retry 在支持该协议的
+ * Core 上复用同一 L0 ids。没有 key 的旧调用仍保留历史 best-effort 语义。
  */
 
 const pendingWrites = new Set<Promise<unknown>>();

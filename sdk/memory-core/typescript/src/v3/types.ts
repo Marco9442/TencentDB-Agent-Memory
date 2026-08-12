@@ -52,6 +52,7 @@ export interface V3IsolationOverrides {
 
 export interface V3ConversationAddRequest {
   session_id?: string;
+  idempotency_key?: string;
   messages: ConversationItem[];
 }
 export type V3ConversationAddData = ConversationAddData;

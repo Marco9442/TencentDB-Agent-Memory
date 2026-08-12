@@ -112,6 +112,10 @@ import {
 /** conversationAdd with session_id defaulting to compatibility bucket. */
 export const conversationAddRequestSchema = z.object({
   session_id: z.string().min(1).default(DEFAULT_ISOLATION_ID),
+  // Optional replay key added in a backward-compatible way. When present,
+  // the gateway reuses deterministic message ids for the same canonical
+  // payload; callers that omit it retain the historical random-id behavior.
+  idempotency_key: z.string().min(1).max(256).optional(),
   messages: z.array(_conversationItemSchema).min(1).max(100),
 });
 export type ConversationAddRequest = z.infer<typeof conversationAddRequestSchema>;

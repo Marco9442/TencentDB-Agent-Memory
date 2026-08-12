@@ -943,6 +943,41 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   // ── L0 Write Operations ──────────────────────────────────
 
+  async getL0RecordsByIds(recordIds: string[]): Promise<L0QueryRow[] | null> {
+    if (recordIds.length === 0) return [];
+    try {
+      await this._ensureInit();
+      if (this.degraded) return null;
+      const response = await this.client.query(this.l0Collection, {
+        retrieveVector: false,
+        documentIds: [...new Set(recordIds)],
+        outputFields: [
+          "id", "session_key", "session_id", "team_id", "task_id",
+          "user_id", "agent_id", "role", "message_text", "recorded_at_ms", "timestamp",
+        ],
+      });
+      return (response.documents ?? []).map((doc: Record<string, unknown>) => {
+        const recordedAtMs = Number(doc.recorded_at_ms ?? 0);
+        return {
+          record_id: String(doc.id ?? ""),
+          session_key: String(doc.session_key ?? ""),
+          session_id: String(doc.session_id ?? ""),
+          team_id: String(doc.team_id ?? ""),
+          task_id: String(doc.task_id ?? ""),
+          user_id: String(doc.user_id ?? ""),
+          agent_id: String(doc.agent_id ?? ""),
+          role: String(doc.role ?? ""),
+          message_text: String(doc.message_text ?? ""),
+          recorded_at: recordedAtMs > 0 ? new Date(recordedAtMs).toISOString() : "",
+          timestamp: Number(doc.timestamp ?? 0),
+        };
+      });
+    } catch (err) {
+      this.logger?.warn(`${TAG} [L0-getByIds] FAILED: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
   async upsertL0(record: L0Record, _embedding?: Float32Array): Promise<boolean> {
     try {
       await this._upsertL0Async(record);

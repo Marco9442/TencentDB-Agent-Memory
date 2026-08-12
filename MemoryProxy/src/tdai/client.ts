@@ -97,14 +97,19 @@ export class TdaiClient {
    * semantics of addConversation(); only final Responses persistence uses this
    * entry point so withL0Retry can observe transient failures.
    */
-  async addConversationStrict(identity: TdaiIdentity, messages: TdaiMessage[]): Promise<void> {
-    await this.addConversationWithMode(identity, messages, "throw");
+  async addConversationStrict(
+    identity: TdaiIdentity,
+    messages: TdaiMessage[],
+    options: { idempotencyKey?: string } = {},
+  ): Promise<void> {
+    await this.addConversationWithMode(identity, messages, "throw", options);
   }
 
   private async addConversationWithMode(
     identity: TdaiIdentity,
     messages: TdaiMessage[],
     failureMode: "soft" | "throw",
+    options: { idempotencyKey?: string } = {},
   ): Promise<void> {
     if (!this.isEnabled() || !this.config.writeL0 || messages.length === 0) return;
 
@@ -119,6 +124,15 @@ export class TdaiClient {
 
     for (let offset = 0; offset < chunkedMessages.length; offset += TDAI_CONVERSATION_MAX_MESSAGES) {
       const batch = chunkedMessages.slice(offset, offset + TDAI_CONVERSATION_MAX_MESSAGES);
+      const chunkIndex = Math.floor(offset / TDAI_CONVERSATION_MAX_MESSAGES);
+      const chunkOptions = options.idempotencyKey
+        ? {
+            ...options,
+            idempotencyKey: chunkedMessages.length > TDAI_CONVERSATION_MAX_MESSAGES
+              ? `${options.idempotencyKey}:chunk:${chunkIndex}`
+              : options.idempotencyKey,
+          }
+        : options;
       await this.postForCtx(
         "/v3/conversation/add",
         { teamId: identity.teamId, userId: identity.userId, agentId: identity.agentId },
@@ -134,6 +148,7 @@ export class TdaiClient {
         identity.taskId,
         { includeSession: true, includeTask: true },
         failureMode,
+        chunkOptions,
       );
     }
   }
@@ -284,6 +299,7 @@ export class TdaiClient {
     taskId: string | undefined,
     options: { includeSession: boolean; includeTask: boolean } = { includeSession: true, includeTask: true },
     failureMode: "soft" | "throw" = "soft",
+    requestOptions: { idempotencyKey?: string } = {},
   ): Promise<T> {
     const base = this.config.endpoint.replace(/\/$/, "");
     const controller = new AbortController();
@@ -299,12 +315,16 @@ export class TdaiClient {
       };
       if (options.includeSession && sessionId) headers["x-tdai-session-id"] = sessionId;
       if (options.includeTask && taskId) headers["x-tdai-task-id"] = taskId;
+      if (requestOptions.idempotencyKey) headers["idempotency-key"] = requestOptions.idempotencyKey;
 
       const res = await fetch(`${base}${path}`, {
         method: "POST",
         signal: controller.signal,
         headers,
-        body: JSON.stringify(stripUndefined(body)),
+        body: JSON.stringify(stripUndefined({
+          ...body,
+          ...(requestOptions.idempotencyKey ? { idempotency_key: requestOptions.idempotencyKey } : {}),
+        })),
       });
       if (!res.ok) {
         const errorText = await res.text().catch(() => "");

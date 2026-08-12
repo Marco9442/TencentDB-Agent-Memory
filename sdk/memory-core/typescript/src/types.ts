@@ -47,6 +47,7 @@ export interface ConversationItem {
 
 export interface ConversationAddRequest extends IdFields {
   session_id: string;
+  idempotency_key?: string;
   messages: ConversationItem[];
 }
 export interface ConversationAddData {

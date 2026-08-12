@@ -17,7 +17,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type http from "node:http";
 import { classifyError } from "./error-handler.js";
-import type { IMemoryStore, L0Record, ProfileSyncRecord } from "../core/store/types.js";
+import type { IMemoryStore, L0QueryRow, L0Record, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import { createScopedStorageAdapter, type StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
@@ -97,6 +97,74 @@ import { buildProfileIsolationScope, buildProfileStableId, DEFAULT_PROFILE_SCOPE
 
 const TAG = "[tdai-gateway][v2]";
 const V2_PREFIX = "/v2";
+
+interface ConversationIdempotencyRecord {
+  payloadHash: string;
+  acceptedIds: string[];
+}
+
+// Hot replay cache. Durable idempotency is anchored in deterministic L0 ids
+// plus getL0RecordsByIds() below; this map only avoids repeated storage reads
+// and coalesces concurrent requests in one process.
+const conversationIdempotency = new Map<string, ConversationIdempotencyRecord>();
+const conversationIdempotencyInflight = new Map<string, { payloadHash: string; promise: Promise<ApiResponseEnvelope> }>();
+const MAX_CONVERSATION_IDEMPOTENCY = 10_000;
+
+export function __resetConversationIdempotencyForTests(): void {
+  conversationIdempotency.clear();
+  conversationIdempotencyInflight.clear();
+}
+
+function canonicalConversationPayload(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalConversationPayload).join(",")}]`;
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalConversationPayload(object[key])}`).join(",")}}`;
+}
+
+function conversationIdempotencyScope(
+  auth: V2AuthContext,
+  sessionId: string,
+  key: string,
+  isolation?: { teamId?: string; userId: string; agentId: string; taskId?: string },
+): string {
+  return `${auth.serviceId}\0${isolation?.teamId ?? ""}\0${isolation?.userId ?? ""}\0${isolation?.agentId ?? ""}\0${isolation?.taskId ?? ""}\0${sessionId}\0${key}`;
+}
+
+function conversationIdempotentMessageIds(
+  auth: V2AuthContext,
+  sessionId: string,
+  key: string,
+  count: number,
+  isolation?: { teamId?: string; userId: string; agentId: string; taskId?: string },
+): string[] {
+  const scope = conversationIdempotencyScope(auth, sessionId, key, isolation);
+  return Array.from({ length: count }, (_, index) => (
+    `msg-idem-${createHash("sha256")
+      .update(`${scope}\0${index}`)
+      .digest("hex").slice(0, 24)}`
+  ));
+}
+
+function l0ReplayRowMatches(
+  row: L0QueryRow,
+  id: string,
+  message: ConversationItem,
+  sessionId: string,
+  isolation?: { teamId?: string; userId: string; agentId: string; taskId?: string },
+): boolean {
+  const explicitTimestamp = message.timestamp ? new Date(message.timestamp).getTime() : undefined;
+  return row.record_id === id
+    && row.session_key === sessionId
+    && row.session_id === sessionId
+    && row.team_id === (isolation?.teamId ?? "")
+    && row.user_id === (isolation?.userId ?? "")
+    && row.agent_id === (isolation?.agentId ?? "")
+    && row.task_id === (isolation?.taskId ?? "")
+    && row.role === message.role
+    && row.message_text === message.content
+    && (explicitTimestamp === undefined || row.timestamp === explicitTimestamp);
+}
 
 /**
  * /v3 是 L0–L3 数据面接口的"严格 isolation 版本"：
@@ -646,8 +714,77 @@ export async function handleV2Route(
 
 async function handleConversationAdd(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = conversationAddRequestSchema.safeParse(body);
+  if (!parsed.success || !parsed.data.idempotency_key) {
+    return handleConversationAddUnlocked(body, auth, requestId, deps);
+  }
+
+  const { session_id: sessionId, idempotency_key: key } = parsed.data;
+  const scope = conversationIdempotencyScope(auth, sessionId, key, deps.requestIsolation);
+  const payloadHash = createHash("sha256").update(canonicalConversationPayload({
+    session_id: sessionId,
+    messages: parsed.data.messages,
+  })).digest("hex");
+  const completed = conversationIdempotency.get(scope);
+  if (completed) {
+    if (completed.payloadHash !== payloadHash) {
+      return errorEnvelope(409, "idempotency_key was already used with a different payload", requestId);
+    }
+    return successEnvelope<ConversationAddData>(
+      { accepted_ids: [...completed.acceptedIds], accepted_versions: completed.acceptedIds.map(() => "v1"), total_count: completed.acceptedIds.length },
+      requestId,
+    );
+  }
+
+  const pending = conversationIdempotencyInflight.get(scope);
+  if (pending) {
+    if (pending.payloadHash !== payloadHash) {
+      return errorEnvelope(409, "idempotency_key is already in flight with a different payload", requestId);
+    }
+    const result = await pending.promise;
+    return result.code === 0
+      ? successEnvelope(result.data, requestId)
+      : result;
+  }
+
+  const acceptedIds = conversationIdempotentMessageIds(
+    auth,
+    sessionId,
+    key,
+    parsed.data.messages.length,
+    deps.requestIsolation,
+  );
+  const operation = (async () => {
+    const result = await handleConversationAddUnlocked(body, auth, requestId, deps, acceptedIds);
+    if (result.code === 0) {
+      const data = result.data as ConversationAddData | undefined;
+      if (data?.accepted_ids) {
+        if (conversationIdempotency.size >= MAX_CONVERSATION_IDEMPOTENCY) {
+          const oldest = conversationIdempotency.keys().next().value as string | undefined;
+          if (oldest) conversationIdempotency.delete(oldest);
+        }
+        conversationIdempotency.set(scope, { payloadHash, acceptedIds: [...data.accepted_ids] });
+      }
+    }
+    return result;
+  })();
+  conversationIdempotencyInflight.set(scope, { payloadHash, promise: operation });
+  try {
+    return await operation;
+  } finally {
+    conversationIdempotencyInflight.delete(scope);
+  }
+}
+
+async function handleConversationAddUnlocked(
+  body: unknown,
+  auth: V2AuthContext,
+  requestId: string,
+  deps: V2RouterDeps,
+  deterministicIds?: string[],
+): Promise<ApiResponseEnvelope> {
+  const parsed = conversationAddRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
-  const { session_id, messages } = parsed.data;
+  const { session_id, messages, idempotency_key: idempotencyKey } = parsed.data;
 
   // Enforce three-dim isolation. user_id / agent_id come from request body
   // or x-tdai-* headers (resolved in dispatchV2Request).  When the gateway's
@@ -666,9 +803,34 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
 
+  const acceptedIds = deterministicIds ?? messages.map(() => `msg-${randomUUID().replace(/-/g, "").slice(0, 12)}`);
+  const existingById = new Map<string, L0QueryRow>();
+  if (idempotencyKey) {
+    const existing = await store.getL0RecordsByIds(acceptedIds);
+    if (existing === null) {
+      return errorEnvelope(503, "Idempotency preflight unavailable", requestId);
+    }
+    for (const row of existing) existingById.set(row.record_id, row);
+    for (const [index, row] of acceptedIds.map((id) => existingById.get(id)).entries()) {
+      if (row && !l0ReplayRowMatches(row, acceptedIds[index], messages[index], session_id, iso)) {
+        return errorEnvelope(409, "idempotency_key was already used with a different payload", requestId);
+      }
+    }
+    if (existingById.size === acceptedIds.length) {
+      return successEnvelope<ConversationAddData>(
+        { accepted_ids: acceptedIds, accepted_versions: acceptedIds.map(() => "v1"), total_count: acceptedIds.length },
+        requestId,
+      );
+    }
+  }
+
+  const missingIndexes = acceptedIds
+    .map((id, index) => existingById.has(id) ? -1 : index)
+    .filter((index) => index >= 0);
+
   // Quota check: memory limit
   if (deps.quotaManager) {
-    const check = await deps.quotaManager.checkMemoryQuota(auth.serviceId, messages.length);
+    const check = await deps.quotaManager.checkMemoryQuota(auth.serviceId, missingIndexes.length);
     if (!check.allowed) {
       return errorEnvelope(4291, `Memory limit exceeded (current=${check.current}, limit=${check.limit})`, requestId);
     }
@@ -694,11 +856,11 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   }
 
   const embedding = deps.getEmbedding();
-  const acceptedIds: string[] = [];
   const ingestBaseMs = Date.now();
 
-  for (const [index, msg] of messages.entries()) {
-    const id = `msg-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  for (const index of missingIndexes) {
+    const msg = messages[index];
+    const id = acceptedIds[index];
     const recordedAtMs = ingestBaseMs + index;
     const record: L0Record = {
       id,
@@ -720,15 +882,16 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
       try { emb = await embedding.embed(msg.content); } catch (e) { console.warn(`[v2-router] L0 embedding failed:`, e); }
     }
 
-    await store.upsertL0(record, emb);
-    acceptedIds.push(id);
+    if (!await store.upsertL0(record, emb)) {
+      return errorEnvelope(503, `Failed to persist conversation message ${index}`, requestId);
+    }
   }
 
   // Notify pipeline: trigger async L1 extraction (service mode).
   // Each role=user message counts as one conversation round for threshold/timer logic.
   // teamId/agentId 透传给 captureAtomic 决定 hash slot 与锁粒度。
   if (deps.notifyPipeline) {
-    const rounds = messages.filter((m) => m.role === "user").length;
+    const rounds = missingIndexes.filter((index) => messages[index].role === "user").length;
     if (rounds > 0) {
       try {
         await deps.notifyPipeline(auth.serviceId, session_id, rounds, iso?.teamId, iso?.agentId);
@@ -749,20 +912,23 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
     if (storage) {
       try {
         const recordKey = StoragePaths.conversation(formatLocalDateForJsonl(new Date(ingestBaseMs)));
-        const lines = messages.map((msg, idx) => JSON.stringify({
-          id: acceptedIds[idx],
-          sessionKey: session_id,
-          sessionId: session_id,
-          taskId: iso?.taskId,
-          teamId: iso?.teamId,
-          userId: iso?.userId,
-          agentId: iso?.agentId,
-          role: msg.role,
-          content: msg.content,
-          recordedAt: new Date(ingestBaseMs + idx).toISOString(),
-          timestamp: msg.timestamp ? new Date(msg.timestamp).getTime() : ingestBaseMs + idx,
-        })).join("\n") + "\n";
-        await storage.appendFile(recordKey, lines);
+        const lines = missingIndexes.map((idx) => {
+          const msg = messages[idx];
+          return JSON.stringify({
+            id: acceptedIds[idx],
+            sessionKey: session_id,
+            sessionId: session_id,
+            taskId: iso?.taskId,
+            teamId: iso?.teamId,
+            userId: iso?.userId,
+            agentId: iso?.agentId,
+            role: msg.role,
+            content: msg.content,
+            recordedAt: new Date(ingestBaseMs + idx).toISOString(),
+            timestamp: msg.timestamp ? new Date(msg.timestamp).getTime() : ingestBaseMs + idx,
+          });
+        }).join("\n") + "\n";
+        if (missingIndexes.length > 0) await storage.appendFile(recordKey, lines);
       } catch (err) {
         deps.logger.warn(`${TAG} JSONL mirror failed for ${session_id}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -770,8 +936,8 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   }
 
   // Report memory usage (non-fatal)
-  if (deps.quotaManager && acceptedIds.length > 0) {
-    deps.quotaManager.reportMemoryAdded(auth.serviceId, acceptedIds.length).catch(() => {});
+  if (deps.quotaManager && missingIndexes.length > 0) {
+    deps.quotaManager.reportMemoryAdded(auth.serviceId, missingIndexes.length).catch(() => {});
   }
 
   return successEnvelope<ConversationAddData>(

@@ -163,6 +163,7 @@ export class MemoryClient {
     return this.http.post(`${V3}/conversation/add`, stripUndefined({
       ...this.iso.baseBody(),
       session_id: this.iso.resolveSessionForWrite(params.session_id),
+      idempotency_key: params.idempotency_key,
       messages: params.messages,
     }));
   }

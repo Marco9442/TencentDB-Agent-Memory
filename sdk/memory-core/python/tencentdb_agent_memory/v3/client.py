@@ -195,6 +195,7 @@ class MemoryClient:
         messages: List[Dict[str, Any]],
         *,
         session_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /v3/conversation/add`` — 写入必填 session_id（构造或调用二选一）。"""
         return self._stub.post(
@@ -202,6 +203,7 @@ class MemoryClient:
             _strip_none({
                 **self._iso.base_body(),
                 "session_id": self._iso.resolve_session_for_write(session_id),
+                "idempotency_key": idempotency_key,
                 "messages": messages,
             }),
         )
@@ -539,6 +541,7 @@ class AsyncMemoryClient:
         messages: List[Dict[str, Any]],
         *,
         session_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /v3/conversation/add`` — 写入必填 session_id（构造或调用二选一）。"""
         return await self._stub.post(
@@ -546,6 +549,7 @@ class AsyncMemoryClient:
             _strip_none({
                 **self._iso.base_body(),
                 "session_id": self._iso.resolve_session_for_write(session_id),
+                "idempotency_key": idempotency_key,
                 "messages": messages,
             }),
         )
