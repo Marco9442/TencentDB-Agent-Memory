@@ -25,12 +25,15 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Pin npm for MemoryCore
+        run: npm install --global npm@11.9.0
+
       - name: Cache node_modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache-deps
         with:
           path: MemoryCore/node_modules
-          key: deps-${{ runner.os }}-${{ hashFiles('MemoryCore/package.json') }}
+          key: deps-${{ runner.os }}-node22-npm11.9.0-${{ hashFiles('MemoryCore/package.json') }}
 
       - name: npm install
         if: steps.cache-deps.outputs.cache-hit != 'true'
@@ -48,11 +51,14 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Pin npm for MemoryCore
+        run: npm install --global npm@11.9.0
+
       - name: Restore node_modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: MemoryCore/node_modules
-          key: deps-${{ runner.os }}-${{ hashFiles('MemoryCore/package.json') }}
+          key: deps-${{ runner.os }}-node22-npm11.9.0-${{ hashFiles('MemoryCore/package.json') }}
 
       - name: npm pack (dry-run)
         run: npm pack --dry-run
