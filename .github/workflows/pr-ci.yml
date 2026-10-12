@@ -17,16 +17,16 @@ jobs:
   # ── 1. Install dependencies ────────────────────────────────
   install:
     name: Install
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
       - name: Cache node_modules
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache-deps
         with:
           path: MemoryCore/node_modules
@@ -40,16 +40,16 @@ jobs:
   pack:
     name: Pack
     needs: install
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
       - name: Restore node_modules
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: MemoryCore/node_modules
           key: deps-${{ runner.os }}-${{ hashFiles('MemoryCore/package.json') }}
@@ -61,7 +61,7 @@ jobs:
         run: npm pack
 
       - name: Upload .tgz artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-tarball
           path: "MemoryCore/*.tgz"
@@ -70,9 +70,9 @@ jobs:
   # ── 5. Plugin manifest validation ──────────────────────────
   manifest:
     name: Manifest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate openclaw.plugin.json
         run: |
@@ -112,10 +112,10 @@ jobs:
   size:
     name: Size Guard
     needs: pack
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: package-tarball
           path: MemoryCore
@@ -144,9 +144,9 @@ jobs:
   # docs/design/2026-06-16-skill-extract-queue.md
   isolation:
     name: Skill Queue Isolation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0   # 需要完整历史以便 git diff base..HEAD
 
@@ -162,14 +162,14 @@ jobs:
   # pnpm lockfile is intentionally not part of this CI validation path.
   memory-proxy:
     name: MemoryProxy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: MemoryProxy
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
